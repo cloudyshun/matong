@@ -1,0 +1,68 @@
+// -------------------------------------------------------------
+// STM32F103C8T6 + MAX485 通信示例
+// 功能：
+//   1. 每隔 5 秒向外发送字符串 "hellow"
+//   2. 收到任何数据后，立即原样返回（回显）
+// -------------------------------------------------------------
+
+#define DE_RE_Pin PB9   // MAX485 模块 DE/RE 控制引脚
+
+void setup() {
+  pinMode(DE_RE_Pin, OUTPUT);
+  digitalWrite(DE_RE_Pin, LOW);  // 默认接收模式
+
+  Serial.begin(9600);   // 调试串口（可选）
+  Serial3.begin(9600);  // 485 串口（通过 MAX485 与外设通信）
+
+  Serial.println("STM32 + MAX485 Echo & Periodic Send Demo");
+}
+
+void loop() {
+  static unsigned long lastSendTime = 0;
+  unsigned long now = millis();
+
+  // -------------------------------------------------------------
+  // 1️⃣ 每隔 5 秒主动发送 "hellow"
+  // -------------------------------------------------------------
+  if (now - lastSendTime >= 5000) { // 每隔 5000ms
+    lastSendTime = now;
+    sendString("hellow");
+  }
+
+  // -------------------------------------------------------------
+  // 2️⃣ 检查是否有接收到的数据
+  // -------------------------------------------------------------
+  if (Serial3.available()) {
+    String recvStr = "";
+
+    // 读取全部已收到的数据
+    while (Serial3.available()) {
+      char c = Serial3.read();
+      recvStr += c;
+      delay(2);  // 短延时，避免粘包
+    }
+
+    Serial.print("Recv: ");
+    Serial.println(recvStr);
+
+    // 回显接收到的数据
+    sendString(recvStr);
+  }
+}
+
+// -------------------------------------------------------------
+// 串口发送函数（带MAX485方向控制）
+// -------------------------------------------------------------
+void sendString(const String &msg) {
+  digitalWrite(DE_RE_Pin, HIGH);   // 切换为发送模式
+  delayMicroseconds(20);
+
+  Serial3.print(msg);              // 发送字符串
+  Serial3.flush();                 // 等待发送完成
+
+  delayMicroseconds(20);
+  digitalWrite(DE_RE_Pin, LOW);    // 回到接收模式
+
+  Serial.print("Sent: ");
+  Serial.println(msg);
+}
