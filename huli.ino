@@ -1,625 +1,330 @@
 /*
- * STM32F103C8T6 温度监控 + 步进电机控制系统 + RS485通信
- * 功能：
- * 1. 在OLED屏幕上显示当前温度
- * 2. 自动控制步进电机转动（非阻塞模式）
- * 3. 通过RS485接收指令控制继电器
- * 硬件连接：
- * - OLED SCL -> PB6 (I2C1_SCL)
- * - OLED SDA -> PB7 (I2C1_SDA)
- * - OLED VCC -> 3.3V, OLED GND -> GND
- * - 步进电机1 A相(5V供电) -> PA3, B相 -> PA4, C相 -> PA5, D相 -> PA6
- * - 步进电机2 A相（5V供电） -> PB0, B相 -> PB1, C相 -> PB10, D相 -> PB11
- * - NTC温度传感器 -> PA0 (ADC输入)
- * - RS485 DE/RE -> PB9 (MAX485控制引脚)
- * - RS485 通信使用 Serial3 (9600波特率)
+ * STM32F103C8T6 纯步进电机控制系统 + RS485通信
+ * 
+ * 硬件连接 (基于提供的原理图):
+ * ---------------------------------------------------------
+ * [电机 1] (原理图右侧 U55)
+ * - A相 -> PB0
+ * - B相 -> PB1
+ * - C相 -> PB10
+ * - D相 -> PB11
+ * 
+ * [电机 2] (原理图左侧 U22)
+ * - A相 -> PA3
+ * - B相 -> PA4
+ * - C相 -> PA5
+ * - D相 -> PA6
+ * ---------------------------------------------------------
+ * - RS485 DE/RE -> PB9
+ * - RS485 TX/RX -> PA9/PA10 (Serial1)
  */
 
-#include <Wire.h>
-#include <Adafruit_GFX.h>
-#include <Adafruit_SSD1306.h>
+#include <Arduino.h>
 
 // RS485控制引脚
 #define DE_RE_Pin PB9
 
-// OLED显示屏参数
-#define SCREEN_WIDTH 128
-#define SCREEN_HEIGHT 64
+// ================= 引脚定义 (严格对应原理图) =================
 
-// NTC温度传感器参数
-#define NTC_PIN PA0          // NTC连接到PA0 (ADC输入)
-#define SERIES_RESISTOR 10000 // 上拉电阻10kΩ
-#define NTC_NOMINAL 10000     // NTC标称阻值10kΩ (25°C时)
-#define TEMPERATURE_NOMINAL 25   // 标称温度25°C
-#define B_COEFFICIENT 3950    // NTC的B值系数(查看数据手册)
-#define ADC_RESOLUTION 4095   // STM32的12位ADC分辨率
+// 【电机 1】定义 (原理图右侧，PB口)
+#define M1_PIN_A  PB0   // U55 Pin 1 -> NET7
+#define M1_PIN_B  PB1   // U55 Pin 2 -> NET8
+#define M1_PIN_C  PB10  // U55 Pin 3 -> NET9
+#define M1_PIN_D  PB11  // U55 Pin 4 -> NET10
 
-//在下面不能使用PB3, PB9已用于RS485
-// #define BUTTON_PIN1 PB4
-// #define BUTTON_PIN2 PB5
-// #define BUTTON_PIN3 PA1
-// #define BUTTON_PIN4 PC13
-// #define BUTTON_PIN5 PC14
-// #define BUTTON_PIN6 PC15
-// #define BUTTON_PIN7 PB9   // PB9已改为RS485控制引脚
-// #define BUTTON_PIN8 PB8//PB8
-// #define BUTTON_PIN9 PA11//PA11--PA15×
-// 第二个步进电机引脚定义
-#define MOTOR_PIN_E  PA3  // A相
-#define MOTOR_PIN_F  PA4  // B相
-#define MOTOR_PIN_G  PA5  // C相
-#define MOTOR_PIN_H  PA6  // D相
-
-#define MOTOR_PIN_A  PB0  // A相
-#define MOTOR_PIN_B  PB1  // B相  
-#define MOTOR_PIN_C  PB4  // C相
-#define MOTOR_PIN_D  PB5 // D相
+// 【电机 2】定义 (原理图左侧，PA口)
+#define M2_PIN_A  PA3   // U22 Pin 1 -> NET3
+#define M2_PIN_B  PA4   // U22 Pin 2 -> NET4
+#define M2_PIN_C  PA5   // U22 Pin 3 -> NET5
+#define M2_PIN_D  PA6   // U22 Pin 4 -> NET6
 
 // 步进电机参数设置
-#define STEPS_PER_REVOLUTION 256  // 每圈步数（完整的4相序列）
-#define STEP_DELAY 20            // 每个完整步进周期延时(毫秒)
+#define STEPS_PER_REVOLUTION 500  // 每圈步数
+#define STEP_DELAY 5             // 步进周期延时(毫秒)速度
 
-// 继电器控制引脚定义
-#define RELAY_PIN_1  PB12  // 继电器1
-#define RELAY_PIN_2  PB13  // 继电器2
-#define RELAY_PIN_3  PB14  // 继电器3
-#define RELAY_PIN_4  PB15  // 继电器4
-#define RELAY_PIN_5  PA8   // 继电器5
-#define RELAY_PIN_6  PA9   // 继电器6
-#define RELAY_PIN_7  PA2   // 继电器7
-#define RELAY_PIN_8  PA7   // 继电器8
-#define RELAY_PIN_9  PA10   // 继电器9
-#define RELAY_PIN_10  PB8   // 继电器9
+// ================= 全局变量 =================
 
+// 电机1 状态变量 (控制 PB0-PB11)
+bool motor1Running = false;
+int motor1StepPhase = 0;
+int motor1StepCycle = 0;
+int motor1TargetSteps = 0;
+unsigned long motor1LastStepTime = 0;
+bool motor1Direction = true;  // true=正向
+bool motor1Enabled = false;   // RS485开启/关闭标志
+int motor1RevolutionCount = 0;
 
-// 继电器状态定义
-#define RELAY_ON  LOW   // 继电器开启
-#define RELAY_OFF HIGH    // 继电器关闭
+// 电机2 状态变量 (控制 PA3-PA6)
+bool motor2Running = false;
+int motor2StepPhase = 0;
+int motor2StepCycle = 0;
+int motor2TargetSteps = 0;
+unsigned long motor2LastStepTime = 0;
+bool motor2Direction = true;  // true=正向
+bool motor2Enabled = false;   // RS485开启/关闭标志
+int motor2RevolutionCount = 0;
 
-// 创建显示对象
-Adafruit_SSD1306 display(SCREEN_WIDTH, SCREEN_HEIGHT, &Wire, -1);
-
-// 全局变量
-float currentTemperature = 0.0;
-bool motorDirection = true;      // true=正向, false=反向
-int revolutionCount = 0;         // 转动圈数计数器
-
-// 时间管理变量
-unsigned long lastTempTime = 0;    // 上次温度更新时间
-unsigned long lastDisplayTime = 0; // 上次显示更新时间
-unsigned long lastStepTime = 0;    // 上次步进时间
-unsigned long lastUploadTime = 0;  // 上次温度上传时间
-
-// 步进电机状态管理
-int currentStep = 0;              // 当前步数
-int targetSteps = 0;              // 目标步数
-bool motorRunning = false;        // 电机运行状态
-int stepPhase = 0;                // 当前步进相位 (0-3)
-int stepCycle = 0;                // 当前步进周期
-unsigned long nextRevolutionTime = 0; // 下次转动时间
-
-// 继电器状态管理
-bool relayStates[10] = {false, false, false, false, false,false, false,false,false,false}; // 5路继电器状态
-const int relayPins[10] = {RELAY_PIN_1, RELAY_PIN_2, RELAY_PIN_3, RELAY_PIN_4, RELAY_PIN_5, RELAY_PIN_6,RELAY_PIN_7, RELAY_PIN_8, RELAY_PIN_9,RELAY_PIN_10};
-
-// RS485通信采用轮询方式(参考rs485.txt可靠实现)
-
-// 8字节十六进制继电器控制命令定义
-const byte relay1OnCmd[8] = {0xEE, 0x01, 0x00, 0x01, 0x00, 0x01, 0x00, 0x00};
-const byte relay1OffCmd[8] = {0xEE, 0x01, 0x00, 0x01, 0x00, 0x02, 0x00, 0x00};
-const byte relay2OnCmd[8] = {0xEE, 0x01, 0x00, 0x02, 0x00, 0x01, 0x00, 0x00};
-const byte relay2OffCmd[8] = {0xEE, 0x01, 0x00, 0x02, 0x00, 0x02, 0x00, 0x00};
-const byte relay3OnCmd[8] = {0xEE, 0x01, 0x00, 0x03, 0x00, 0x01, 0x00, 0x00};
-const byte relay3OffCmd[8] = {0xEE, 0x01, 0x00, 0x03, 0x00, 0x02, 0x00, 0x00};
-const byte relay4OnCmd[8] = {0xEE, 0x01, 0x00, 0x04, 0x00, 0x01, 0x00, 0x00};
-const byte relay4OffCmd[8] = {0xEE, 0x01, 0x00, 0x04, 0x00, 0x02, 0x00, 0x00};
-const byte relay5OnCmd[8] = {0xEE, 0x01, 0x00, 0x05, 0x00, 0x01, 0x00, 0x00};
-const byte relay5OffCmd[8] = {0xEE, 0x01, 0x00, 0x05, 0x00, 0x02, 0x00, 0x00};
-const byte relay6OnCmd[8] = {0xEE, 0x01, 0x00, 0x06, 0x00, 0x01, 0x00, 0x00};
-const byte relay6OffCmd[8] = {0xEE, 0x01, 0x00, 0x06, 0x00, 0x02, 0x00, 0x00};
-const byte relay7OnCmd[8] = {0xEE, 0x01, 0x00, 0x07, 0x00, 0x01, 0x00, 0x00};
-const byte relay7OffCmd[8] = {0xEE, 0x01, 0x00, 0x07, 0x00, 0x02, 0x00, 0x00};
-const byte relay8OnCmd[8] = {0xEE, 0x01, 0x00, 0x08, 0x00, 0x01, 0x00, 0x00};
-const byte relay8OffCmd[8] = {0xEE, 0x01, 0x00, 0x08, 0x00, 0x02, 0x00, 0x00};
-const byte relay9OnCmd[8] = {0xEE, 0x01, 0x00, 0x09, 0x00, 0x01, 0x00, 0x00};
-const byte relay9OffCmd[8] = {0xEE, 0x01, 0x00, 0x09, 0x00, 0x02, 0x00, 0x00};
-const byte relay10OnCmd[8] = {0xEE, 0x01, 0x00, 0x0A, 0x00, 0x01, 0x00, 0x00};
-const byte relay10OffCmd[8] = {0xEE, 0x01, 0x00, 0x0A, 0x00, 0x02, 0x00, 0x00};
+// RS485控制指令 (HEX)
+const byte motor1OnCmd[8]  = {0xEE, 0x01, 0x00, 0x01, 0x00, 0x01, 0x00, 0x00}; // 电机1 开启
+const byte motor1OffCmd[8] = {0xEE, 0x01, 0x00, 0x01, 0x00, 0x02, 0x00, 0x00}; // 电机1 关闭
+const byte motor2OnCmd[8]  = {0xEE, 0x01, 0x00, 0x02, 0x00, 0x01, 0x00, 0x00}; // 电机2 开启
+const byte motor2OffCmd[8] = {0xEE, 0x01, 0x00, 0x02, 0x00, 0x02, 0x00, 0x00}; // 电机2 关闭
 
 // RS485接收缓冲区
 byte rs485Buffer[8];
 int rs485Index = 0;
 
-// 双相激励序列表
+// 双相激励序列表 (正转)
 const bool stepPattern[4][4] = {
-  {HIGH, HIGH, LOW,  LOW },  // AB相
-  {LOW,  HIGH, HIGH, LOW },  // BC相
-  {LOW,  LOW,  HIGH, HIGH},  // CD相
-  {HIGH, LOW,  LOW,  HIGH}   // DA相
+  {HIGH, HIGH, LOW,  LOW },  // AB
+  {LOW,  HIGH, HIGH, LOW },  // BC
+  {LOW,  LOW,  HIGH, HIGH},  // CD
+  {HIGH, LOW,  LOW,  HIGH}   // DA
 };
 
+// 双相激励序列表 (反转)
 const bool stepPatternReverse[4][4] = {
-  {HIGH, LOW,  LOW,  HIGH},  // DA相
-  {LOW,  LOW,  HIGH, HIGH},  // CD相
-  {LOW,  HIGH, HIGH, LOW },  // BC相
-  {HIGH, HIGH, LOW,  LOW }   // AB相
+  {HIGH, LOW,  LOW,  HIGH},  // DA
+  {LOW,  LOW,  HIGH, HIGH},  // CD
+  {LOW,  HIGH, HIGH, LOW },  // BC
+  {HIGH, HIGH, LOW,  LOW }   // AB
 };
+
+// 函数声明
+void stopMotor1();
+void stopMotor2();
+void startMotor1();
+void startMotor2();
+void executeStepPhaseMotor1();
+void executeStepPhaseMotor2();
+void finishRevolutionMotor1();
+void finishRevolutionMotor2();
+void handleStepperMotor(unsigned long currentTime);
+void handleRS485Commands();
+void processHexCommand(byte cmd[8]);
+void sendHex485(byte data[8]);
 
 void setup() {
-  Serial.begin(9600);
+  Serial.begin(9600); // 调试串口
   delay(1000);
-  Serial.println("STM32 温度监控+步进电机+RS485控制系统启动...");
+  Serial.println("STM32 Dual Motor Control Started...");
 
-  // 初始化RS485通信
+  // 初始化RS485
   pinMode(DE_RE_Pin, OUTPUT);
-  digitalWrite(DE_RE_Pin, LOW);  // 默认接收模式
-  Serial3.begin(9600);  // RS485串口
-  Serial.println("RS485初始化完成");
+  digitalWrite(DE_RE_Pin, LOW);  // 接收模式
+  Serial1.begin(9600);
+  Serial.println("RS485 Ready");
   
-  // 初始化ADC用于NTC温度读取
-  pinMode(NTC_PIN, INPUT_ANALOG);
-  Serial.println("NTC温度传感器初始化完成");
+  // 初始化【电机1】引脚 (PB口)
+  pinMode(M1_PIN_A, OUTPUT);
+  pinMode(M1_PIN_B, OUTPUT);
+  pinMode(M1_PIN_C, OUTPUT);
+  pinMode(M1_PIN_D, OUTPUT);
   
-  // 初始化步进电机控制引脚
-  pinMode(MOTOR_PIN_A, OUTPUT);
-  pinMode(MOTOR_PIN_B, OUTPUT);
-  pinMode(MOTOR_PIN_C, OUTPUT);
-  pinMode(MOTOR_PIN_D, OUTPUT);
-  
-  // 初始化所有电机引脚为低电平
-  stopMotor();
-  Serial.println("步进电机初始化完成");
-  
-  // 初始化继电器控制引脚
-  relayInit();
-  Serial.println("继电器初始化完成");
-  
-  // 初始化I2C用于OLED
-  Wire.begin();
-  delay(100);
-  Serial.println("I2C初始化完成");
+  // 初始化【电机2】引脚 (PA口)
+  pinMode(M2_PIN_A, OUTPUT);
+  pinMode(M2_PIN_B, OUTPUT);
+  pinMode(M2_PIN_C, OUTPUT);
+  pinMode(M2_PIN_D, OUTPUT);
 
-  // 初始化OLED显示屏(调试时禁用以提升RS485响应速度)
-  /*
-  Serial.println("初始化OLED显示屏...");
-  if(display.begin(SSD1306_SWITCHCAPVCC, 0x3C)) {
-    Serial.println("OLED初始化成功!");
-  } else if(display.begin(SSD1306_SWITCHCAPVCC, 0x3D)) {
-    Serial.println("OLED初始化成功! (地址0x3D)");
-  } else {
-    Serial.println("OLED初始化失败!");
-  }
-
-  // 显示启动画面
-  displayStartup();
-  delay(2000);
-  */
+  // 初始停止所有电机
+  stopMotor1();
+  stopMotor2();
+  Serial.println("Motors Initialized");
 
   // 初始化时间戳
   unsigned long currentTime = millis();
-  lastTempTime = currentTime;
-  lastDisplayTime = currentTime;
-  lastStepTime = currentTime;
-  lastUploadTime = currentTime;
-  nextRevolutionTime = currentTime + 3000; // 3秒后开始第一次转动
-
-  setupSecondMotor();
-  Serial.println("系统启动完成!");
-  Serial.println("开始温度监控、步进电机控制、RS485通信...");
+  motor1LastStepTime = currentTime;
+  motor2LastStepTime = currentTime;
 }
-
-// 初始化第二个电机引脚（在 setup() 里调用）
-void setupSecondMotor() {
-  pinMode(MOTOR_PIN_E, OUTPUT);
-  pinMode(MOTOR_PIN_F, OUTPUT);
-  pinMode(MOTOR_PIN_G, OUTPUT);
-  pinMode(MOTOR_PIN_H, OUTPUT);
-  stopSecondMotor();
-}
-// 停止第二个电机（所有线圈断电）
-void stopSecondMotor() {
-  digitalWrite(MOTOR_PIN_E, LOW);
-  digitalWrite(MOTOR_PIN_F, LOW);
-  digitalWrite(MOTOR_PIN_G, LOW);
-  digitalWrite(MOTOR_PIN_H, LOW);
-}
-// 同步步进动作
-void executeStepPhaseSecondMotor(int stepPhase, bool direction) {
-  const bool (*pattern)[4] = direction ? stepPattern : stepPatternReverse;
-  digitalWrite(MOTOR_PIN_E, pattern[stepPhase][0]);
-  digitalWrite(MOTOR_PIN_F, pattern[stepPhase][1]);
-  digitalWrite(MOTOR_PIN_G, pattern[stepPhase][2]);
-  digitalWrite(MOTOR_PIN_H, pattern[stepPhase][3]);
-}
-// 同步封装
-void handleStepperMotorSync(unsigned long now) {
-  handleStepperMotor(now);  // 原电机控制
-  if (motorRunning) {
-    executeStepPhaseSecondMotor(stepPhase, motorDirection);
-  } else {
-    stopSecondMotor();
-  }
-}
-
 
 void loop() {
-  unsigned long currentTime = millis();
+  // 任务1: 步进电机逻辑
+  handleStepperMotor(millis());
 
-  // 任务1: 温度读取 (每2秒)
-  if(currentTime - lastTempTime >= 2000) {
-    currentTemperature = readTemperature();
-    lastTempTime = currentTime;
-  }
-
-  // 任务2: 显示更新 (调试时禁用以提升RS485响应速度)
-  /*
-  if(currentTime - lastDisplayTime >= 1000) {
-    displayTemperature();
-    lastDisplayTime = currentTime;
-  }
-  */
-
-  // 任务3: 步进电机控制 (非阻塞)
-  handleStepperMotorSync(millis());
-
-  // 任务4: 启动新的转动周期 (每8秒)
-  if(currentTime >= nextRevolutionTime && !motorRunning) {
-    startNewRevolution();
-    nextRevolutionTime = currentTime + 8000; // 下次转动间隔8秒
-  }
-
-  // 任务5: 温度数据上传 (每5秒)
-  if(currentTime - lastUploadTime >= 5000) {
-    uploadTemperatureData();
-    lastUploadTime = currentTime;
-  }
-
-  // 任务6: 处理RS485接收指令(轮询方式,与rs485.txt一致)
+  // 任务2: RS485指令处理
   handleRS485Commands();
 }
 
-// 按键控制功能已全部移除,改用RS485指令控制
-
-// 非阻塞步进电机控制
+// 步进电机核心控制逻辑
 void handleStepperMotor(unsigned long currentTime) {
-  // 只有在电机运行且到达步进时间时才执行
-  if(motorRunning && (currentTime - lastStepTime >= 5)) { // 5ms每个相位
-    
-    // 执行当前相位
-    executeStepPhase();
-    stepPhase++;
-    
-    // 完成一个完整的4相步进周期
-    if(stepPhase >= 4) {
-      stepPhase = 0;
-      stepCycle++;
-      
-      // 检查是否完成一圈
-      if(stepCycle >= targetSteps) {
-        finishRevolution();
-        return;
+  // ---------------- 电机 1 (PB口) 控制 ----------------
+  if(!motor1Running && motor1Enabled) {
+    startMotor1();
+  }
+
+  if(motor1Running && (currentTime - motor1LastStepTime >= STEP_DELAY)) { 
+    executeStepPhaseMotor1(); // 驱动 PB 引脚
+    motor1StepPhase++;
+
+    if(motor1StepPhase >= 4) {
+      motor1StepPhase = 0;
+      motor1StepCycle++;
+      if(motor1StepCycle >= motor1TargetSteps) {
+        finishRevolutionMotor1();
       }
     }
-    
-    lastStepTime = currentTime;
+    motor1LastStepTime = currentTime;
+  }
+
+  // ---------------- 电机 2 (PA口) 控制 ----------------
+  if(!motor2Running && motor2Enabled) {
+    startMotor2();
+  }
+
+  if(motor2Running && (currentTime - motor2LastStepTime >= STEP_DELAY)) { 
+    executeStepPhaseMotor2(); // 驱动 PA 引脚
+    motor2StepPhase++;
+
+    if(motor2StepPhase >= 4) {
+      motor2StepPhase = 0;
+      motor2StepCycle++;
+      if(motor2StepCycle >= motor2TargetSteps) {
+        finishRevolutionMotor2();
+      }
+    }
+    motor2LastStepTime = currentTime;
   }
 }
 
-// 执行单个相位（非阻塞）
-void executeStepPhase() {
-  const bool (*pattern)[4] = motorDirection ? stepPattern : stepPatternReverse;
-  
-  digitalWrite(MOTOR_PIN_A, pattern[stepPhase][0]);
-  digitalWrite(MOTOR_PIN_B, pattern[stepPhase][1]);
-  digitalWrite(MOTOR_PIN_C, pattern[stepPhase][2]);
-  digitalWrite(MOTOR_PIN_D, pattern[stepPhase][3]);
+// 执行电机1相位 (PB0, PB1, PB10, PB11)
+void executeStepPhaseMotor1() {
+  const bool (*pattern)[4] = motor1Direction ? stepPattern : stepPatternReverse;
+  digitalWrite(M1_PIN_A, pattern[motor1StepPhase][0]);
+  digitalWrite(M1_PIN_B, pattern[motor1StepPhase][1]);
+  digitalWrite(M1_PIN_C, pattern[motor1StepPhase][2]);
+  digitalWrite(M1_PIN_D, pattern[motor1StepPhase][3]);
 }
 
-// 开始新的转动周期
-void startNewRevolution() {
-  if(motorRunning) return; // 防止重复启动
-  
-  revolutionCount++;
-  stepCycle = 0;
-  stepPhase = 0;
-  targetSteps = STEPS_PER_REVOLUTION;
-  motorRunning = true;
+// 执行电机2相位 (PA3, PA4, PA5, PA6)
+void executeStepPhaseMotor2() {
+  const bool (*pattern)[4] = motor2Direction ? stepPattern : stepPatternReverse;
+  digitalWrite(M2_PIN_A, pattern[motor2StepPhase][0]);
+  digitalWrite(M2_PIN_B, pattern[motor2StepPhase][1]);
+  digitalWrite(M2_PIN_C, pattern[motor2StepPhase][2]);
+  digitalWrite(M2_PIN_D, pattern[motor2StepPhase][3]);
 }
 
-// 完成一圈转动
-void finishRevolution() {
-  motorRunning = false;
-  stopMotor();  
-  // 切换方向准备下次转动
-  motorDirection = !motorDirection;
+// 启动电机1
+void startMotor1() {
+  if(motor1Running) return; 
+  motor1RevolutionCount++;
+  motor1StepCycle = 0;
+  motor1StepPhase = 0;
+  motor1TargetSteps = STEPS_PER_REVOLUTION;
+  motor1Running = true;
+  Serial.println("Start Motor 1 (PB Pins)");
 }
 
-// 停止电机
-void stopMotor() {
-  digitalWrite(MOTOR_PIN_A, LOW);
-  digitalWrite(MOTOR_PIN_B, LOW);
-  digitalWrite(MOTOR_PIN_C, LOW);
-  digitalWrite(MOTOR_PIN_D, LOW);
+// 启动电机2
+void startMotor2() {
+  if(motor2Running) return; 
+  motor2RevolutionCount++;
+  motor2StepCycle = 0;
+  motor2StepPhase = 0;
+  motor2TargetSteps = STEPS_PER_REVOLUTION;
+  motor2Running = true;
+  Serial.println("Start Motor 2 (PA Pins)");
 }
 
-// 读取NTC温度传感器(优化版 - 减少浮点运算)
-float readTemperature() {
-  // 读取ADC值
-  int adcValue = analogRead(NTC_PIN);
-
-  // 计算NTC阻值
-  float resistance = SERIES_RESISTOR * adcValue / (float)(ADC_RESOLUTION - adcValue);
-
-  // 使用Steinhart-Hart方程计算温度
-  float steinhart = log(resistance / NTC_NOMINAL) / B_COEFFICIENT;
-  steinhart += 1.0 / (TEMPERATURE_NOMINAL + 273.15);
-  steinhart = 1.0 / steinhart - 273.15;
-
-  return steinhart;
+// 完成一圈：电机1
+void finishRevolutionMotor1() {
+  motor1Running = false;
+  stopMotor1();
+  motor1Direction = !motor1Direction; // 自动反向
 }
 
-// 显示启动画面
-void displayStartup() {
-  display.clearDisplay();
-  display.setTextSize(2);
-  display.setTextColor(SSD1306_WHITE);
-  display.setCursor(15, 10);
-  display.println("STM32");
-  display.setTextSize(1);
-  display.setCursor(10, 35);
-  display.println("Temperature");
-  display.setCursor(25, 50);
-  display.println("Monitor");
-  display.display();
+// 完成一圈：电机2
+void finishRevolutionMotor2() {
+  motor2Running = false;
+  stopMotor2();
+  motor2Direction = !motor2Direction; // 自动反向
 }
 
-// 继电器初始化函数 - 修改后的版本
-void relayInit() {
-  Serial.println("开始继电器初始化...");
-  
-  // 逐个初始化每个继电器引脚，立即设置为关闭状态
-  for(int i = 0; i < 10; i++) {
-    pinMode(relayPins[i], OUTPUT);
-    digitalWrite(relayPins[i], RELAY_OFF);  // 立即设置为关闭状态
-    relayStates[i] = false;
-    delay(10);  // 短暂延时确保状态稳定
-  }
-  
-  Serial.println("所有继电器已设置为关闭状态");
+// 停止电机1 (拉低PB口)
+void stopMotor1() {
+  digitalWrite(M1_PIN_A, LOW);
+  digitalWrite(M1_PIN_B, LOW);
+  digitalWrite(M1_PIN_C, LOW);
+  digitalWrite(M1_PIN_D, LOW);
 }
 
-// 显示温度信息 - 纯温度显示
-void displayTemperature() {
-  display.clearDisplay();
-
-  // 标题
-  display.setTextSize(1);
-  display.setTextColor(SSD1306_WHITE);
-  display.setCursor(30, 5);
-  display.println("Temperature");
-
-  // 温度值 - 居中显示
-  display.setTextSize(3);
-  display.setCursor(5, 25);
-  display.print(currentTemperature, 1);
-  display.println("C");
-
-  // 度数符号
-  display.setTextSize(1);
-  display.setCursor(90, 25);
-  display.println("o");
-
-  display.display();
+// 停止电机2 (拉低PA口)
+void stopMotor2() {
+  digitalWrite(M2_PIN_A, LOW);
+  digitalWrite(M2_PIN_B, LOW);
+  digitalWrite(M2_PIN_C, LOW);
+  digitalWrite(M2_PIN_D, LOW);
 }
 
-// ========== RS485通信功能 ==========
-
-// 温度值转换为补码的辅助函数
-void temperatureToTwoBytes(float temp, byte &highByte, byte &lowByte) {
-  int16_t tempInt = (int16_t)(temp * 10);  // 温度×10,转为整数
-  highByte = (tempInt >> 8) & 0xFF;         // 高字节
-  lowByte = tempInt & 0xFF;                 // 低字节
-}
-
-// RS485发送16进制数据函数
+// RS485发送
 void sendHex485(byte data[8]) {
-  digitalWrite(DE_RE_Pin, HIGH);   // 切换为发送模式
-  delayMicroseconds(20);           // 等待20微秒
+  digitalWrite(DE_RE_Pin, HIGH);
+  delayMicroseconds(20);
+  Serial1.write(data, 8);
+  Serial1.flush();
+  delayMicroseconds(20);
+  digitalWrite(DE_RE_Pin, LOW);
 
-  Serial3.write(data, 8);          // 发送8字节数据
-  Serial3.flush();                 // 等待发送完成
-
-  delayMicroseconds(20);           // 等待20微秒
-  digitalWrite(DE_RE_Pin, LOW);    // 回到接收模式
-
-  Serial.print("Sent HEX: ");
+  Serial.print("Sent: ");
   for (int i = 0; i < 8; i++) {
-    if (data[i] < 16) Serial.print("0");
-    Serial.print(data[i], HEX);
-    Serial.print(" ");
+    Serial.print(data[i], HEX); Serial.print(" ");
   }
   Serial.println();
 }
 
-// 温度数据上传函数
-void uploadTemperatureData() {
-  // 构建8字节十六进制温度数据帧
-  // 格式: EE 10 00 01 00 01 [温度高字节] [温度低字节]
-  byte tempFrame[8];
-  tempFrame[0] = 0xEE;
-  tempFrame[1] = 0x10;
-  tempFrame[2] = 0x00;
-  tempFrame[3] = 0x01;
-  tempFrame[4] = 0x00;
-  tempFrame[5] = 0x01;
-
-  // 将温度转换为补码形式的两个字节
-  temperatureToTwoBytes(currentTemperature, tempFrame[6], tempFrame[7]);
-
-  // 通过RS485发送温度数据
-  sendHex485(tempFrame);
-
-  Serial.print("Temperature uploaded: ");
-  Serial.print(currentTemperature, 1);
-  Serial.println("°C");
-}
-
-// 处理RS485接收到的8字节十六进制指令(优化版 - 减少超时等待)
+// RS485接收处理
 void handleRS485Commands() {
-  while (Serial3.available()) {
-    byte receivedByte = Serial3.read();
-
-    // 查找帧头 0xEE
-    if (receivedByte == 0xEE) {
+  while (Serial1.available()) {
+    byte receivedByte = Serial1.read();
+    if (receivedByte == 0xEE) { // 帧头
       rs485Buffer[0] = receivedByte;
       rs485Index = 1;
-
-      // 尝试接收剩余7字节，带超时机制
       unsigned long startTime = millis();
       while (rs485Index < 8) {
-        if (Serial3.available()) {
-          rs485Buffer[rs485Index] = Serial3.read();
-          rs485Index++;
+        if (Serial1.available()) {
+          rs485Buffer[rs485Index++] = Serial1.read();
         }
-        // 超时检测（20ms）
-        if (millis() - startTime > 20) {
-          Serial.println("Timeout: Incomplete data");
+        if (millis() - startTime > 20) { // 超时
           rs485Index = 0;
           return;
         }
       }
-
-      // 如果成功接收到8字节，处理命令
       if (rs485Index == 8) {
-        // 打印接收到的十六进制数据
-        Serial.print("Recv HEX: ");
-        for (int i = 0; i < 8; i++) {
-          if (rs485Buffer[i] < 16) Serial.print("0");
-          Serial.print(rs485Buffer[i], HEX);
-          Serial.print(" ");
-        }
-        Serial.println();
-
-        // 处理8字节命令
         processHexCommand(rs485Buffer);
       }
-
-      // 重置缓冲区
       rs485Index = 0;
     }
-    // 如果不是帧头，继续查找下一个0xEE
   }
 }
 
-// 8字节十六进制指令解析与执行
+// 解析指令
 void processHexCommand(byte cmd[8]) {
-  // 检查帧头是否为0xEE
-  if (cmd[0] != 0xEE) {
-    // 错误帧头不响应,或者可以发送错误响应帧
-    return;
-  }
+  if (cmd[0] != 0xEE) return;
 
-  // 继电器1控制
-  if (memcmp(cmd, relay1OnCmd, 8) == 0) {
-    setRelay(0, true);
-    sendHex485(cmd);  // 返回接收到的原指令
+  // 比较指令
+  if (memcmp(cmd, motor1OnCmd, 8) == 0) {
+    motor1Enabled = true; // 开启电机1 (PB)
+    Serial.println("CMD: Enable Motor 1");
+    sendHex485(cmd);
   }
-  else if (memcmp(cmd, relay1OffCmd, 8) == 0) {
-    setRelay(0, false);
-    sendHex485(cmd);  // 返回接收到的原指令
+  else if (memcmp(cmd, motor1OffCmd, 8) == 0) {
+    motor1Enabled = false; // 关闭电机1 (PB)
+    motor1Running = false;
+    stopMotor1();
+    Serial.println("CMD: Stop Motor 1");
+    sendHex485(cmd);
   }
-  // 继电器2控制
-  else if (memcmp(cmd, relay2OnCmd, 8) == 0) {
-    setRelay(1, true);
-    sendHex485(cmd);  // 返回接收到的原指令
+  else if (memcmp(cmd, motor2OnCmd, 8) == 0) {
+    motor2Enabled = true; // 开启电机2 (PA)
+    Serial.println("CMD: Enable Motor 2");
+    sendHex485(cmd);
   }
-  else if (memcmp(cmd, relay2OffCmd, 8) == 0) {
-    setRelay(1, false);
-    sendHex485(cmd);  // 返回接收到的原指令
-  }
-  // 继电器3控制
-  else if (memcmp(cmd, relay3OnCmd, 8) == 0) {
-    setRelay(2, true);
-    sendHex485(cmd);  // 返回接收到的原指令
-  }
-  else if (memcmp(cmd, relay3OffCmd, 8) == 0) {
-    setRelay(2, false);
-    sendHex485(cmd);  // 返回接收到的原指令
-  }
-  // 继电器4控制
-  else if (memcmp(cmd, relay4OnCmd, 8) == 0) {
-    setRelay(3, true);
-    sendHex485(cmd);  // 返回接收到的原指令
-  }
-  else if (memcmp(cmd, relay4OffCmd, 8) == 0) {
-    setRelay(3, false);
-    sendHex485(cmd);  // 返回接收到的原指令
-  }
-  // 继电器5控制
-  else if (memcmp(cmd, relay5OnCmd, 8) == 0) {
-    setRelay(4, true);
-    sendHex485(cmd);  // 返回接收到的原指令
-  }
-  else if (memcmp(cmd, relay5OffCmd, 8) == 0) {
-    setRelay(4, false);
-    sendHex485(cmd);  // 返回接收到的原指令
-  }
-  // 继电器6控制
-  else if (memcmp(cmd, relay6OnCmd, 8) == 0) {
-    setRelay(5, true);
-    sendHex485(cmd);  // 返回接收到的原指令
-  }
-  else if (memcmp(cmd, relay6OffCmd, 8) == 0) {
-    setRelay(5, false);
-    sendHex485(cmd);  // 返回接收到的原指令
-  }
-  // 继电器7控制
-  else if (memcmp(cmd, relay7OnCmd, 8) == 0) {
-    setRelay(6, true);
-    sendHex485(cmd);  // 返回接收到的原指令
-  }
-  else if (memcmp(cmd, relay7OffCmd, 8) == 0) {
-    setRelay(6, false);
-    sendHex485(cmd);  // 返回接收到的原指令
-  }
-  // 继电器8控制
-  else if (memcmp(cmd, relay8OnCmd, 8) == 0) {
-    setRelay(7, true);
-    sendHex485(cmd);  // 返回接收到的原指令
-  }
-  else if (memcmp(cmd, relay8OffCmd, 8) == 0) {
-    setRelay(7, false);
-    sendHex485(cmd);  // 返回接收到的原指令
-  }
-  // 继电器9控制
-  else if (memcmp(cmd, relay9OnCmd, 8) == 0) {
-    setRelay(8, true);
-    sendHex485(cmd);  // 返回接收到的原指令
-  }
-  else if (memcmp(cmd, relay9OffCmd, 8) == 0) {
-    setRelay(8, false);
-    sendHex485(cmd);  // 返回接收到的原指令
-  }
-  // 继电器10控制
-  else if (memcmp(cmd, relay10OnCmd, 8) == 0) {
-    setRelay(9, true);
-    sendHex485(cmd);  // 返回接收到的原指令
-  }
-  else if (memcmp(cmd, relay10OffCmd, 8) == 0) {
-    setRelay(9, false);
-    sendHex485(cmd);  // 返回接收到的原指令
-  }
-  // 未知指令不响应
-}
-
-// 设置继电器状态 (统一控制函数)
-void setRelay(int relayIndex, bool state) {
-  if (relayIndex >= 0 && relayIndex < 10) {
-    relayStates[relayIndex] = state;
-    digitalWrite(relayPins[relayIndex], state ? RELAY_ON : RELAY_OFF);
-    Serial.print("Relay ");
-    Serial.print(relayIndex + 1);
-    Serial.print(" set to ");
-    Serial.println(state ? "ON" : "OFF");
+  else if (memcmp(cmd, motor2OffCmd, 8) == 0) {
+    motor2Enabled = false; // 关闭电机2 (PA)
+    motor2Running = false;
+    stopMotor2();
+    Serial.println("CMD: Stop Motor 2");
+    sendHex485(cmd);
   }
 }
