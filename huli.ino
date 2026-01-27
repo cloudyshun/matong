@@ -1,18 +1,21 @@
 /*
- * STM32F103C8T6 步进电机控制系统 (74HC595 + ULN2803版)
+ * STM32F103C8T6 步进电机 + 强电控制系统
  * 
  * 功能更新：
- * 1. 上电自动正转一圈。
- * 2. 指令① (01): M1反转，M2正转 (1圈)。
- * 3. 指令② (02): M1反转，M2反转 (1圈)。
- * 4. 指令③ (03): M1 M2先同时逆转1圈，随后M2单独正转0.4圈(200步)。
- * 5. 单独指令修改：原“停止”指令现改为“反转1圈”。
+ * 1. 步进电机控制 (74HC595 + ULN2803) - 保持原有逻辑
+ * 2. [新增] 强电负载过零开关控制 (PA1, PA2, PA3, PA4)
  * 
  * 硬件连接:
  * - 74HC595: PA5(Data), PA6(Latch), PA7(Clock)
  * - RS485: PA8(Control), PA9/PA10(UART)
  * - 电机1: PB口 (低4位)
  * - 电机2: PA口 (高4位)
+ * 
+ * [新增强电控制] (低电平有效)
+ * - 风扇加热丝: PA1
+ * - 水泵: PA2
+ * - 水即热装置: PA3
+ * - 粉碎泵: PA4
  */
 
 #include <Arduino.h>
@@ -20,9 +23,16 @@
 // ================= 引脚定义 =================
 #define DE_RE_Pin PA8
 
+// 74HC595 (步进电机)
 #define PIN_595_DATA   PA5
 #define PIN_595_LATCH  PA6
 #define PIN_595_CLOCK  PA7
+
+// 强电负载引脚 (根据原理图)
+#define PIN_FAN        PA1 // 风扇加热丝
+#define PIN_PUMP       PA2 // 水泵
+#define PIN_HEATER     PA3 // 水即热装置
+#define PIN_MACERATOR  PA4 // 粉碎泵
 
 // ================= 参数设置 =================
 #define STEPS_PER_REVOLUTION 500  // 每圈步数
@@ -64,16 +74,29 @@ int motor2RevolutionCount = 0;
 
 // ============ RS485控制指令定义 ============
 
-// 单独控制
+// --- 步进电机指令 ---
 const byte motor1FwdCmd[8] = {0xEE, 0x01, 0x00, 0x01, 0x00, 0x01, 0x00, 0x00}; // M1 正转
-const byte motor1RevCmd[8] = {0xEE, 0x01, 0x00, 0x01, 0x00, 0x02, 0x00, 0x00}; // M1 反转 (原停止)
+const byte motor1RevCmd[8] = {0xEE, 0x01, 0x00, 0x01, 0x00, 0x02, 0x00, 0x00}; // M1 反转
 const byte motor2FwdCmd[8] = {0xEE, 0x01, 0x00, 0x02, 0x00, 0x01, 0x00, 0x00}; // M2 正转
-const byte motor2RevCmd[8] = {0xEE, 0x01, 0x00, 0x02, 0x00, 0x02, 0x00, 0x00}; // M2 反转 (原停止)
-
-// 组合指令
+const byte motor2RevCmd[8] = {0xEE, 0x01, 0x00, 0x02, 0x00, 0x02, 0x00, 0x00}; // M2 反转
 const byte cmdAction1[8]  = {0xEE, 0x01, 0x00, 0x01, 0x00, 0x00, 0x00, 0x00}; // M1逆 M2正
 const byte cmdAction2[8]  = {0xEE, 0x01, 0x00, 0x02, 0x00, 0x00, 0x00, 0x00}; // 全逆
 const byte cmdAction3[8]  = {0xEE, 0x01, 0x00, 0x03, 0x00, 0x00, 0x00, 0x00}; // 复合动作
+
+// --- [新增] 强电负载指令 ---
+// 风扇加热丝 (PA1)
+const byte cmdFanOn[8]  = {0xEE, 0x01, 0x00, 0x01, 0x00, 0x01, 0x01, 0x00}; // 指令⑤
+const byte cmdFanOff[8] = {0xEE, 0x01, 0x00, 0x01, 0x00, 0x01, 0x01, 0x01}; // 指令⑥
+// 水泵 (PA2)
+const byte cmdPumpOn[8] = {0xEE, 0x01, 0x00, 0x01, 0x00, 0x01, 0x02, 0x00}; // 指令⑦
+const byte cmdPumpOff[8]= {0xEE, 0x01, 0x00, 0x01, 0x00, 0x01, 0x02, 0x01}; // 指令⑧
+// 水即热装置 (PA3)
+const byte cmdHeatOn[8] = {0xEE, 0x01, 0x00, 0x01, 0x00, 0x01, 0x03, 0x00}; // 指令⑨
+const byte cmdHeatOff[8]= {0xEE, 0x01, 0x00, 0x01, 0x00, 0x01, 0x03, 0x01}; // 指令⑩
+// 粉碎泵 (PA4)
+const byte cmdMacOn[8]  = {0xEE, 0x01, 0x00, 0x01, 0x00, 0x01, 0x04, 0x00}; // 指令11
+const byte cmdMacOff[8] = {0xEE, 0x01, 0x00, 0x01, 0x00, 0x01, 0x04, 0x01}; // 指令12
+
 
 byte rs485Buffer[8];
 int rs485Index = 0;
@@ -100,16 +123,32 @@ void sendHex485(byte data[8]);
 void setup() {
   Serial.begin(9600);
   delay(1000);
-  Serial.println("STM32 Motor System Started");
+  Serial.println("STM32 Control System Started");
 
   pinMode(DE_RE_Pin, OUTPUT);
   digitalWrite(DE_RE_Pin, LOW); 
   Serial1.begin(9600);
   
+  // 步进电机引脚初始化
   pinMode(PIN_595_DATA, OUTPUT);
   pinMode(PIN_595_LATCH, OUTPUT);
   pinMode(PIN_595_CLOCK, OUTPUT);
 
+  // --- [新增] 强电引脚初始化 ---
+  // 注意：低电平有效，所以初始化为 HIGH (关闭状态)
+  pinMode(PIN_FAN, OUTPUT);
+  digitalWrite(PIN_FAN, HIGH);
+  
+  pinMode(PIN_PUMP, OUTPUT);
+  digitalWrite(PIN_PUMP, HIGH);
+  
+  pinMode(PIN_HEATER, OUTPUT);
+  digitalWrite(PIN_HEATER, HIGH);
+  
+  pinMode(PIN_MACERATOR, OUTPUT);
+  digitalWrite(PIN_MACERATOR, HIGH);
+
+  // 步进电机清空
   stopMotor1();
   stopMotor2();
   updateShiftRegister(); 
@@ -274,10 +313,72 @@ void handleRS485Commands() {
 void processHexCommand(byte cmd[8]) {
   if (cmd[0] != 0xEE) return;
   
-  // 安全重置区
+  // --- 电机逻辑安全重置 ---
+  // 注意：强电开关状态不需要重置，保持当前状态即可
   command3Status = 0;
-  nextTargetSteps1 = STEPS_PER_REVOLUTION; // 500
-  nextTargetSteps2 = STEPS_PER_REVOLUTION; // 500
+  nextTargetSteps1 = STEPS_PER_REVOLUTION; 
+  nextTargetSteps2 = STEPS_PER_REVOLUTION; 
+
+  // ================= 强电控制指令 (5-12) =================
+  
+  // 指令⑤: 打开风扇 (PA1 LOW)
+  if (memcmp(cmd, cmdFanOn, 8) == 0) {
+    digitalWrite(PIN_FAN, LOW);
+    Serial.println("CMD: Fan ON");
+    sendHex485(cmd);
+    return; // 处理完直接返回，提高效率
+  }
+  // 指令⑥: 关闭风扇 (PA1 HIGH)
+  else if (memcmp(cmd, cmdFanOff, 8) == 0) {
+    digitalWrite(PIN_FAN, HIGH);
+    Serial.println("CMD: Fan OFF");
+    sendHex485(cmd);
+    return;
+  }
+  // 指令⑦: 打开水泵 (PA2 LOW)
+  else if (memcmp(cmd, cmdPumpOn, 8) == 0) {
+    digitalWrite(PIN_PUMP, LOW);
+    Serial.println("CMD: Pump ON");
+    sendHex485(cmd);
+    return;
+  }
+  // 指令⑧: 关闭水泵 (PA2 HIGH)
+  else if (memcmp(cmd, cmdPumpOff, 8) == 0) {
+    digitalWrite(PIN_PUMP, HIGH);
+    Serial.println("CMD: Pump OFF");
+    sendHex485(cmd);
+    return;
+  }
+  // 指令⑨: 打开水即热 (PA3 LOW)
+  else if (memcmp(cmd, cmdHeatOn, 8) == 0) {
+    digitalWrite(PIN_HEATER, LOW);
+    Serial.println("CMD: Heater ON");
+    sendHex485(cmd);
+    return;
+  }
+  // 指令⑩: 关闭水即热 (PA3 HIGH)
+  else if (memcmp(cmd, cmdHeatOff, 8) == 0) {
+    digitalWrite(PIN_HEATER, HIGH);
+    Serial.println("CMD: Heater OFF");
+    sendHex485(cmd);
+    return;
+  }
+  // 指令11: 打开粉碎泵 (PA4 LOW)
+  else if (memcmp(cmd, cmdMacOn, 8) == 0) {
+    digitalWrite(PIN_MACERATOR, LOW);
+    Serial.println("CMD: Macerator ON");
+    sendHex485(cmd);
+    return;
+  }
+  // 指令12: 关闭粉碎泵 (PA4 HIGH)
+  else if (memcmp(cmd, cmdMacOff, 8) == 0) {
+    digitalWrite(PIN_MACERATOR, HIGH);
+    Serial.println("CMD: Macerator OFF");
+    sendHex485(cmd);
+    return;
+  }
+
+  // ================= 步进电机控制指令 (1-4) =================
 
   // 指令①: M1逆 M2正
   if (memcmp(cmd, cmdAction1, 8) == 0) {
@@ -314,7 +415,7 @@ void processHexCommand(byte cmd[8]) {
     Serial.println("CMD: M1 Forward 1 Rev");
     sendHex485(cmd);
   }
-  // M1 反转 (原停止指令)
+  // M1 反转
   else if (memcmp(cmd, motor1RevCmd, 8) == 0) {
     motor1Running = false;
     motor1Direction = false; // 反转
@@ -330,7 +431,7 @@ void processHexCommand(byte cmd[8]) {
     Serial.println("CMD: M2 Forward 1 Rev");
     sendHex485(cmd);
   }
-  // M2 反转 (原停止指令)
+  // M2 反转
   else if (memcmp(cmd, motor2RevCmd, 8) == 0) {
     motor2Running = false;
     motor2Direction = false; // 反转
