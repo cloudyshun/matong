@@ -1,19 +1,16 @@
 /*
- * STM32F103C8T6 纯步进电机控制系统 + RS485通信
+ * STM32F103C8T6 步进电机控制系统 (74HC595 + ULN2803版)
  * 
- * 硬件连接 (基于提供的原理图):
+ * 硬件连接 (基于新原理图):
  * ---------------------------------------------------------
- * [电机 1] (原理图右侧 U55)
- * - A相 -> PB0
- * - B相 -> PB1
- * - C相 -> PB10
- * - D相 -> PB11
+ * [控制芯片] 74HC595 (U3)
+ * - DS (SER)   -> PA5   (数据)
+ * - STCP (RCLK)-> PA6   (锁存)
+ * - SHCP (SRCLK)-> PA7  (时钟)
  * 
- * [电机 2] (原理图左侧 U22)
- * - A相 -> PA3
- * - B相 -> PA4
- * - C相 -> PA5
- * - D相 -> PA6
+ * [驱动输出] ULN2803 (U1) -> 步进电机
+ * - 74HC595 QA-QD -> ULN2803 I1-I4 -> J8 (电机 1) -> 对应数据低4位
+ * - 74HC595 QE-QH -> ULN2803 I5-I8 -> J7 (电机 2) -> 对应数据高4位
  * ---------------------------------------------------------
  * - RS485 DE/RE -> PB9
  * - RS485 TX/RX -> PA9/PA10 (Serial1)
@@ -21,82 +18,74 @@
 
 #include <Arduino.h>
 
+// ================= 引脚定义 =================
+
 // RS485控制引脚
 #define DE_RE_Pin PB9
 
-// ================= 引脚定义 (严格对应原理图) =================
+// 74HC595 控制引脚
+#define PIN_595_DATA   PA5  // DS
+#define PIN_595_LATCH  PA6  // STCP
+#define PIN_595_CLOCK  PA7  // SHCP
 
-// 【电机 1】定义 (原理图右侧，PB口)
-#define M1_PIN_A  PB0   // U55 Pin 1 -> NET7
-#define M1_PIN_B  PB1   // U55 Pin 2 -> NET8
-#define M1_PIN_C  PB10  // U55 Pin 3 -> NET9
-#define M1_PIN_D  PB11  // U55 Pin 4 -> NET10
-
-// 【电机 2】定义 (原理图左侧，PA口)
-#define M2_PIN_A  PA3   // U22 Pin 1 -> NET3
-#define M2_PIN_B  PA4   // U22 Pin 2 -> NET4
-#define M2_PIN_C  PA5   // U22 Pin 3 -> NET5
-#define M2_PIN_D  PA6   // U22 Pin 4 -> NET6
-
-// 步进电机参数设置
+// ================= 参数设置 =================
 #define STEPS_PER_REVOLUTION 500  // 每圈步数
-#define STEP_DELAY 5             // 步进周期延时(毫秒)速度
+#define STEP_DELAY 5              // 步进速度(ms) - 12V供电可适当改小
 
 // ================= 全局变量 =================
 
-// 电机1 状态变量 (控制 PB0-PB11)
+// 缓存当前发送给 74HC595 的 8位数据
+// 高4位存电机2，低4位存电机1
+byte currentShiftOutput = 0; 
+byte motor1Nibble = 0; // 电机1的当前4位状态 (0000-1111)
+byte motor2Nibble = 0; // 电机2的当前4位状态 (0000-1111)
+
+// 电机1 状态变量
 bool motor1Running = false;
 int motor1StepPhase = 0;
 int motor1StepCycle = 0;
 int motor1TargetSteps = 0;
 unsigned long motor1LastStepTime = 0;
-bool motor1Direction = true;  // true=正向
-bool motor1Enabled = false;   // RS485开启/关闭标志
+bool motor1Direction = true;  
+bool motor1Enabled = false;   
 int motor1RevolutionCount = 0;
 
-// 电机2 状态变量 (控制 PA3-PA6)
+// 电机2 状态变量
 bool motor2Running = false;
 int motor2StepPhase = 0;
 int motor2StepCycle = 0;
 int motor2TargetSteps = 0;
 unsigned long motor2LastStepTime = 0;
-bool motor2Direction = true;  // true=正向
-bool motor2Enabled = false;   // RS485开启/关闭标志
+bool motor2Direction = true; 
+bool motor2Enabled = false;   
 int motor2RevolutionCount = 0;
 
-// RS485控制指令 (HEX)
-const byte motor1OnCmd[8]  = {0xEE, 0x01, 0x00, 0x01, 0x00, 0x01, 0x00, 0x00}; // 电机1 开启
-const byte motor1OffCmd[8] = {0xEE, 0x01, 0x00, 0x01, 0x00, 0x02, 0x00, 0x00}; // 电机1 关闭
-const byte motor2OnCmd[8]  = {0xEE, 0x01, 0x00, 0x02, 0x00, 0x01, 0x00, 0x00}; // 电机2 开启
-const byte motor2OffCmd[8] = {0xEE, 0x01, 0x00, 0x02, 0x00, 0x02, 0x00, 0x00}; // 电机2 关闭
+// RS485控制指令 (保持不变)
+const byte motor1OnCmd[8]  = {0xEE, 0x01, 0x00, 0x01, 0x00, 0x01, 0x00, 0x00};
+const byte motor1OffCmd[8] = {0xEE, 0x01, 0x00, 0x01, 0x00, 0x02, 0x00, 0x00};
+const byte motor2OnCmd[8]  = {0xEE, 0x01, 0x00, 0x02, 0x00, 0x01, 0x00, 0x00};
+const byte motor2OffCmd[8] = {0xEE, 0x01, 0x00, 0x02, 0x00, 0x02, 0x00, 0x00};
 
 // RS485接收缓冲区
 byte rs485Buffer[8];
 int rs485Index = 0;
 
-// 双相激励序列表 (正转)
-const bool stepPattern[4][4] = {
-  {HIGH, HIGH, LOW,  LOW },  // AB
-  {LOW,  HIGH, HIGH, LOW },  // BC
-  {LOW,  LOW,  HIGH, HIGH},  // CD
-  {HIGH, LOW,  LOW,  HIGH}   // DA
-};
+// 双相激励序列表 (使用 HEX 格式方便移位操作)
+// 对应二进制: 1100, 0110, 0011, 1001
+const byte stepPatternHex[4] = {0x0C, 0x06, 0x03, 0x09};
 
-// 双相激励序列表 (反转)
-const bool stepPatternReverse[4][4] = {
-  {HIGH, LOW,  LOW,  HIGH},  // DA
-  {LOW,  LOW,  HIGH, HIGH},  // CD
-  {LOW,  HIGH, HIGH, LOW },  // BC
-  {HIGH, HIGH, LOW,  LOW }   // AB
-};
+// 反转序列
+// 对应二进制: 1001, 0011, 0110, 1100
+const byte stepPatternHexRev[4] = {0x09, 0x03, 0x06, 0x0C};
 
 // 函数声明
+void updateShiftRegister();
 void stopMotor1();
 void stopMotor2();
 void startMotor1();
 void startMotor2();
-void executeStepPhaseMotor1();
-void executeStepPhaseMotor2();
+void calculatePhaseMotor1();
+void calculatePhaseMotor2();
 void finishRevolutionMotor1();
 void finishRevolutionMotor2();
 void handleStepperMotor(unsigned long currentTime);
@@ -105,32 +94,26 @@ void processHexCommand(byte cmd[8]);
 void sendHex485(byte data[8]);
 
 void setup() {
-  Serial.begin(9600); // 调试串口
+  Serial.begin(9600);
   delay(1000);
-  Serial.println("STM32 Dual Motor Control Started...");
+  Serial.println("STM32 74HC595 Motor Control Started...");
 
   // 初始化RS485
   pinMode(DE_RE_Pin, OUTPUT);
-  digitalWrite(DE_RE_Pin, LOW);  // 接收模式
+  digitalWrite(DE_RE_Pin, LOW); 
   Serial1.begin(9600);
-  Serial.println("RS485 Ready");
   
-  // 初始化【电机1】引脚 (PB口)
-  pinMode(M1_PIN_A, OUTPUT);
-  pinMode(M1_PIN_B, OUTPUT);
-  pinMode(M1_PIN_C, OUTPUT);
-  pinMode(M1_PIN_D, OUTPUT);
-  
-  // 初始化【电机2】引脚 (PA口)
-  pinMode(M2_PIN_A, OUTPUT);
-  pinMode(M2_PIN_B, OUTPUT);
-  pinMode(M2_PIN_C, OUTPUT);
-  pinMode(M2_PIN_D, OUTPUT);
+  // 初始化 74HC595 引脚
+  pinMode(PIN_595_DATA, OUTPUT);
+  pinMode(PIN_595_LATCH, OUTPUT);
+  pinMode(PIN_595_CLOCK, OUTPUT);
 
-  // 初始停止所有电机
+  // 初始清空输出 (停止电机)
   stopMotor1();
   stopMotor2();
-  Serial.println("Motors Initialized");
+  updateShiftRegister(); // 确保输出为 0
+  
+  Serial.println("System Ready");
 
   // 初始化时间戳
   unsigned long currentTime = millis();
@@ -139,22 +122,32 @@ void setup() {
 }
 
 void loop() {
-  // 任务1: 步进电机逻辑
   handleStepperMotor(millis());
-
-  // 任务2: RS485指令处理
   handleRS485Commands();
 }
 
-// 步进电机核心控制逻辑
+// ================= 核心控制逻辑 =================
+
+// 将数据发送到 74HC595
+void updateShiftRegister() {
+  // 拼接数据：高4位是电机2，低4位是电机1
+  currentShiftOutput = (motor2Nibble << 4) | (motor1Nibble & 0x0F);
+
+  digitalWrite(PIN_595_LATCH, LOW); // 拉低锁存，准备传输
+  // LSBFIRST: 低位先出。QA 是数据的最低位(Bit 0)，QH 是最高位(Bit 7)
+  // 我们的连接是 QA->电机1，QH->电机2，所以刚好对应
+  shiftOut(PIN_595_DATA, PIN_595_CLOCK, LSBFIRST, currentShiftOutput);
+  digitalWrite(PIN_595_LATCH, HIGH); // 拉高锁存，输出数据
+}
+
 void handleStepperMotor(unsigned long currentTime) {
-  // ---------------- 电机 1 (PB口) 控制 ----------------
+  // --- 电机 1 逻辑 ---
   if(!motor1Running && motor1Enabled) {
     startMotor1();
   }
 
   if(motor1Running && (currentTime - motor1LastStepTime >= STEP_DELAY)) { 
-    executeStepPhaseMotor1(); // 驱动 PB 引脚
+    calculatePhaseMotor1(); // 计算电机1的新状态
     motor1StepPhase++;
 
     if(motor1StepPhase >= 4) {
@@ -165,15 +158,16 @@ void handleStepperMotor(unsigned long currentTime) {
       }
     }
     motor1LastStepTime = currentTime;
+    updateShiftRegister(); // 更新硬件输出
   }
 
-  // ---------------- 电机 2 (PA口) 控制 ----------------
+  // --- 电机 2 逻辑 ---
   if(!motor2Running && motor2Enabled) {
     startMotor2();
   }
 
   if(motor2Running && (currentTime - motor2LastStepTime >= STEP_DELAY)) { 
-    executeStepPhaseMotor2(); // 驱动 PA 引脚
+    calculatePhaseMotor2(); // 计算电机2的新状态
     motor2StepPhase++;
 
     if(motor2StepPhase >= 4) {
@@ -184,28 +178,28 @@ void handleStepperMotor(unsigned long currentTime) {
       }
     }
     motor2LastStepTime = currentTime;
+    updateShiftRegister(); // 更新硬件输出
   }
 }
 
-// 执行电机1相位 (PB0, PB1, PB10, PB11)
-void executeStepPhaseMotor1() {
-  const bool (*pattern)[4] = motor1Direction ? stepPattern : stepPatternReverse;
-  digitalWrite(M1_PIN_A, pattern[motor1StepPhase][0]);
-  digitalWrite(M1_PIN_B, pattern[motor1StepPhase][1]);
-  digitalWrite(M1_PIN_C, pattern[motor1StepPhase][2]);
-  digitalWrite(M1_PIN_D, pattern[motor1StepPhase][3]);
+// 计算电机1的相位数据 (低4位)
+void calculatePhaseMotor1() {
+  if (motor1Direction) {
+    motor1Nibble = stepPatternHex[motor1StepPhase];
+  } else {
+    motor1Nibble = stepPatternHexRev[motor1StepPhase];
+  }
 }
 
-// 执行电机2相位 (PA3, PA4, PA5, PA6)
-void executeStepPhaseMotor2() {
-  const bool (*pattern)[4] = motor2Direction ? stepPattern : stepPatternReverse;
-  digitalWrite(M2_PIN_A, pattern[motor2StepPhase][0]);
-  digitalWrite(M2_PIN_B, pattern[motor2StepPhase][1]);
-  digitalWrite(M2_PIN_C, pattern[motor2StepPhase][2]);
-  digitalWrite(M2_PIN_D, pattern[motor2StepPhase][3]);
+// 计算电机2的相位数据 (高4位)
+void calculatePhaseMotor2() {
+  if (motor2Direction) {
+    motor2Nibble = stepPatternHex[motor2StepPhase];
+  } else {
+    motor2Nibble = stepPatternHexRev[motor2StepPhase];
+  }
 }
 
-// 启动电机1
 void startMotor1() {
   if(motor1Running) return; 
   motor1RevolutionCount++;
@@ -213,10 +207,9 @@ void startMotor1() {
   motor1StepPhase = 0;
   motor1TargetSteps = STEPS_PER_REVOLUTION;
   motor1Running = true;
-  Serial.println("Start Motor 1 (PB Pins)");
+  Serial.println("Start Motor 1");
 }
 
-// 启动电机2
 void startMotor2() {
   if(motor2Running) return; 
   motor2RevolutionCount++;
@@ -224,40 +217,33 @@ void startMotor2() {
   motor2StepPhase = 0;
   motor2TargetSteps = STEPS_PER_REVOLUTION;
   motor2Running = true;
-  Serial.println("Start Motor 2 (PA Pins)");
+  Serial.println("Start Motor 2");
 }
 
-// 完成一圈：电机1
 void finishRevolutionMotor1() {
   motor1Running = false;
-  stopMotor1();
-  motor1Direction = !motor1Direction; // 自动反向
+  stopMotor1(); // 这会把 motor1Nibble 设为 0
+  motor1Direction = !motor1Direction;
+  updateShiftRegister(); // 立即更新以停止输出
 }
 
-// 完成一圈：电机2
 void finishRevolutionMotor2() {
   motor2Running = false;
-  stopMotor2();
-  motor2Direction = !motor2Direction; // 自动反向
+  stopMotor2(); // 这会把 motor2Nibble 设为 0
+  motor2Direction = !motor2Direction;
+  updateShiftRegister(); // 立即更新以停止输出
 }
 
-// 停止电机1 (拉低PB口)
 void stopMotor1() {
-  digitalWrite(M1_PIN_A, LOW);
-  digitalWrite(M1_PIN_B, LOW);
-  digitalWrite(M1_PIN_C, LOW);
-  digitalWrite(M1_PIN_D, LOW);
+  motor1Nibble = 0x00; // 所有相位关闭
 }
 
-// 停止电机2 (拉低PA口)
 void stopMotor2() {
-  digitalWrite(M2_PIN_A, LOW);
-  digitalWrite(M2_PIN_B, LOW);
-  digitalWrite(M2_PIN_C, LOW);
-  digitalWrite(M2_PIN_D, LOW);
+  motor2Nibble = 0x00; // 所有相位关闭
 }
 
-// RS485发送
+// ================= RS485 通信 (保持不变) =================
+
 void sendHex485(byte data[8]) {
   digitalWrite(DE_RE_Pin, HIGH);
   delayMicroseconds(20);
@@ -273,11 +259,10 @@ void sendHex485(byte data[8]) {
   Serial.println();
 }
 
-// RS485接收处理
 void handleRS485Commands() {
   while (Serial1.available()) {
     byte receivedByte = Serial1.read();
-    if (receivedByte == 0xEE) { // 帧头
+    if (receivedByte == 0xEE) {
       rs485Buffer[0] = receivedByte;
       rs485Index = 1;
       unsigned long startTime = millis();
@@ -285,7 +270,7 @@ void handleRS485Commands() {
         if (Serial1.available()) {
           rs485Buffer[rs485Index++] = Serial1.read();
         }
-        if (millis() - startTime > 20) { // 超时
+        if (millis() - startTime > 20) {
           rs485Index = 0;
           return;
         }
@@ -298,33 +283,33 @@ void handleRS485Commands() {
   }
 }
 
-// 解析指令
 void processHexCommand(byte cmd[8]) {
   if (cmd[0] != 0xEE) return;
 
-  // 比较指令
   if (memcmp(cmd, motor1OnCmd, 8) == 0) {
-    motor1Enabled = true; // 开启电机1 (PB)
-    Serial.println("CMD: Enable Motor 1");
+    motor1Enabled = true;
+    Serial.println("CMD: Enable M1");
     sendHex485(cmd);
   }
   else if (memcmp(cmd, motor1OffCmd, 8) == 0) {
-    motor1Enabled = false; // 关闭电机1 (PB)
+    motor1Enabled = false;
     motor1Running = false;
     stopMotor1();
-    Serial.println("CMD: Stop Motor 1");
+    updateShiftRegister(); // 立即生效
+    Serial.println("CMD: Stop M1");
     sendHex485(cmd);
   }
   else if (memcmp(cmd, motor2OnCmd, 8) == 0) {
-    motor2Enabled = true; // 开启电机2 (PA)
-    Serial.println("CMD: Enable Motor 2");
+    motor2Enabled = true;
+    Serial.println("CMD: Enable M2");
     sendHex485(cmd);
   }
   else if (memcmp(cmd, motor2OffCmd, 8) == 0) {
-    motor2Enabled = false; // 关闭电机2 (PA)
+    motor2Enabled = false;
     motor2Running = false;
     stopMotor2();
-    Serial.println("CMD: Stop Motor 2");
+    updateShiftRegister(); // 立即生效
+    Serial.println("CMD: Stop M2");
     sendHex485(cmd);
   }
 }
