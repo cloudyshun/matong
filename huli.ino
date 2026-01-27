@@ -3,27 +3,25 @@
  * 
  * 功能更新：
  * 1. 上电自动正转一圈。
- * 2. 指令① (EE...01...00): 电机1反转，电机2正转。 <--- 已修改
- * 3. 指令② (EE...02...00): 电机1反转，电机2反转。 <--- 保持不变
+ * 2. 指令① (01): M1反转，M2正转 (1圈)。
+ * 3. 指令② (02): M1反转，M2反转 (1圈)。
+ * 4. 指令③ (03): M1 M2先同时逆转1圈，随后M2单独正转0.4圈(200步)。 <--- 新增
  * 
  * 硬件连接:
  * - 74HC595: PA5(Data), PA6(Latch), PA7(Clock)
  * - RS485: PA8(Control), PA9/PA10(UART)
- * - 电机1: PB口 (数据低4位) -> 对应 74HC595 QA-QD
- * - 电机2: PA口 (数据高4位) -> 对应 74HC595 QE-QH
+ * - 电机1: PB口 (低4位)
+ * - 电机2: PA口 (高4位)
  */
 
 #include <Arduino.h>
 
 // ================= 引脚定义 =================
-
-// RS485控制引脚 (PA8)
 #define DE_RE_Pin PA8
 
-// 74HC595 控制引脚
-#define PIN_595_DATA   PA5  // DS
-#define PIN_595_LATCH  PA6  // STCP
-#define PIN_595_CLOCK  PA7  // SHCP
+#define PIN_595_DATA   PA5
+#define PIN_595_LATCH  PA6
+#define PIN_595_CLOCK  PA7
 
 // ================= 参数设置 =================
 #define STEPS_PER_REVOLUTION 500  // 每圈步数
@@ -31,50 +29,59 @@
 
 // ================= 全局变量 =================
 
-// 缓存当前发送给 74HC595 的 8位数据
+// 缓存数据
 byte currentShiftOutput = 0; 
-byte motor1Nibble = 0; // 电机1的当前4位状态
-byte motor2Nibble = 0; // 电机2的当前4位状态
+byte motor1Nibble = 0; 
+byte motor2Nibble = 0; 
 
-// 电机1 状态变量
+// --- 关键新增：可变的目标步数 ---
+int nextTargetSteps1 = STEPS_PER_REVOLUTION; // 电机1下次启动的目标步数
+int nextTargetSteps2 = STEPS_PER_REVOLUTION; // 电机2下次启动的目标步数
+
+// --- 关键新增：指令3的状态机 ---
+// 0: 无指令3
+// 1: 阶段一 (都在逆转)
+// 2: 阶段二 (M2单独正转)
+int command3Status = 0; 
+
+// 电机1 状态
 bool motor1Running = false;
 int motor1StepPhase = 0;
 int motor1StepCycle = 0;
 int motor1TargetSteps = 0;
 unsigned long motor1LastStepTime = 0;
-bool motor1Direction = true;  // true=正转, false=反转
-bool motor1Enabled = false;   // 运行使能标志
+bool motor1Direction = true;  
+bool motor1Enabled = false;   
 int motor1RevolutionCount = 0;
 
-// 电机2 状态变量
+// 电机2 状态
 bool motor2Running = false;
 int motor2StepPhase = 0;
 int motor2StepCycle = 0;
 int motor2TargetSteps = 0;
 unsigned long motor2LastStepTime = 0;
-bool motor2Direction = true;  // true=正转, false=反转
-bool motor2Enabled = false;   // 运行使能标志
+bool motor2Direction = true;  
+bool motor2Enabled = false;   
 int motor2RevolutionCount = 0;
 
-// ============ RS485控制指令定义 (HEX) ============
+// ============ RS485控制指令定义 ============
 
-// 单独控制指令
-const byte motor1OnCmd[8]  = {0xEE, 0x01, 0x00, 0x01, 0x00, 0x01, 0x00, 0x00}; // M1 单独正转
-const byte motor1OffCmd[8] = {0xEE, 0x01, 0x00, 0x01, 0x00, 0x02, 0x00, 0x00}; // M1 停止
-const byte motor2OnCmd[8]  = {0xEE, 0x01, 0x00, 0x02, 0x00, 0x01, 0x00, 0x00}; // M2 单独正转
-const byte motor2OffCmd[8] = {0xEE, 0x01, 0x00, 0x02, 0x00, 0x02, 0x00, 0x00}; // M2 停止
+// 单独控制
+const byte motor1OnCmd[8]  = {0xEE, 0x01, 0x00, 0x01, 0x00, 0x01, 0x00, 0x00}; 
+const byte motor1OffCmd[8] = {0xEE, 0x01, 0x00, 0x01, 0x00, 0x02, 0x00, 0x00}; 
+const byte motor2OnCmd[8]  = {0xEE, 0x01, 0x00, 0x02, 0x00, 0x01, 0x00, 0x00}; 
+const byte motor2OffCmd[8] = {0xEE, 0x01, 0x00, 0x02, 0x00, 0x02, 0x00, 0x00}; 
 
-// 【组合控制指令】
-// 指令①: 01号组合指令
-const byte cmdAction1[8]  = {0xEE, 0x01, 0x00, 0x01, 0x00, 0x00, 0x00, 0x00};
-// 指令②: 02号组合指令
-const byte cmdAction2[8]  = {0xEE, 0x01, 0x00, 0x02, 0x00, 0x00, 0x00, 0x00};
+// 组合指令
+const byte cmdAction1[8]  = {0xEE, 0x01, 0x00, 0x01, 0x00, 0x00, 0x00, 0x00}; // M1逆 M2正
+const byte cmdAction2[8]  = {0xEE, 0x01, 0x00, 0x02, 0x00, 0x00, 0x00, 0x00}; // 全逆
+// 【新增】指令③
+const byte cmdAction3[8]  = {0xEE, 0x01, 0x00, 0x03, 0x00, 0x00, 0x00, 0x00}; // 复合动作
 
-// RS485接收缓冲区
 byte rs485Buffer[8];
 int rs485Index = 0;
 
-// 双相激励序列表 (HEX格式)
+// 双相激励序列表
 const byte stepPatternHex[4] = {0x0C, 0x06, 0x03, 0x09};
 const byte stepPatternHexRev[4] = {0x09, 0x03, 0x06, 0x0C};
 
@@ -96,74 +103,57 @@ void sendHex485(byte data[8]);
 void setup() {
   Serial.begin(9600);
   delay(1000);
-  Serial.println("STM32 74HC595 Motor Control Started...");
+  Serial.println("STM32 Motor System Started");
 
-  // 初始化RS485控制脚 (PA8)
   pinMode(DE_RE_Pin, OUTPUT);
-  digitalWrite(DE_RE_Pin, LOW); // 默认接收模式
+  digitalWrite(DE_RE_Pin, LOW); 
   Serial1.begin(9600);
   
-  // 初始化 74HC595 引脚
   pinMode(PIN_595_DATA, OUTPUT);
   pinMode(PIN_595_LATCH, OUTPUT);
   pinMode(PIN_595_CLOCK, OUTPUT);
 
-  // 初始清空输出
   stopMotor1();
   stopMotor2();
   updateShiftRegister(); 
   
-  Serial.println("System Ready");
-
-  // 初始化时间戳
-  unsigned long currentTime = millis();
-  motor1LastStepTime = currentTime;
-  motor2LastStepTime = currentTime;
-
-  // ========== 上电默认行为 ==========
-  // 目前保持上电全正转。如果需要改成别的，请告诉我。
-  motor1Direction = true; // 正转
-  motor2Direction = true; // 正转
+  // ========== 上电默认：全正转1圈 ==========
+  nextTargetSteps1 = STEPS_PER_REVOLUTION;
+  nextTargetSteps2 = STEPS_PER_REVOLUTION;
+  motor1Direction = true; 
+  motor2Direction = true; 
   motor1Enabled = true;
   motor2Enabled = true;
+  command3Status = 0; // 确保非特殊模式
   
   Serial.println("Auto Start: All Forward");
 }
 
 void loop() {
-  // 任务1: 步进电机逻辑
   handleStepperMotor(millis());
-
-  // 任务2: RS485指令处理
   handleRS485Commands();
 }
 
 // ================= 核心控制逻辑 =================
 
-// 将数据发送到 74HC595
 void updateShiftRegister() {
-  // 拼接数据：高4位是电机2，低4位是电机1
   currentShiftOutput = (motor2Nibble << 4) | (motor1Nibble & 0x0F);
-
   digitalWrite(PIN_595_LATCH, LOW); 
   shiftOut(PIN_595_DATA, PIN_595_CLOCK, LSBFIRST, currentShiftOutput);
   digitalWrite(PIN_595_LATCH, HIGH); 
 }
 
 void handleStepperMotor(unsigned long currentTime) {
-  // --- 电机 1 逻辑 ---
+  // --- 电机 1 ---
   if(!motor1Running && motor1Enabled) {
     startMotor1();
   }
-
   if(motor1Running && (currentTime - motor1LastStepTime >= STEP_DELAY)) { 
     calculatePhaseMotor1(); 
     motor1StepPhase++;
-
     if(motor1StepPhase >= 4) {
       motor1StepPhase = 0;
       motor1StepCycle++;
-      // 检查是否完成一圈
       if(motor1StepCycle >= motor1TargetSteps) {
         finishRevolutionMotor1();
       }
@@ -172,19 +162,16 @@ void handleStepperMotor(unsigned long currentTime) {
     updateShiftRegister(); 
   }
 
-  // --- 电机 2 逻辑 ---
+  // --- 电机 2 ---
   if(!motor2Running && motor2Enabled) {
     startMotor2();
   }
-
   if(motor2Running && (currentTime - motor2LastStepTime >= STEP_DELAY)) { 
     calculatePhaseMotor2(); 
     motor2StepPhase++;
-
     if(motor2StepPhase >= 4) {
       motor2StepPhase = 0;
       motor2StepCycle++;
-      // 检查是否完成一圈
       if(motor2StepCycle >= motor2TargetSteps) {
         finishRevolutionMotor2();
       }
@@ -194,22 +181,14 @@ void handleStepperMotor(unsigned long currentTime) {
   }
 }
 
-// 计算电机1的相位数据
 void calculatePhaseMotor1() {
-  if (motor1Direction) {
-    motor1Nibble = stepPatternHex[motor1StepPhase];
-  } else {
-    motor1Nibble = stepPatternHexRev[motor1StepPhase];
-  }
+  if (motor1Direction) motor1Nibble = stepPatternHex[motor1StepPhase];
+  else motor1Nibble = stepPatternHexRev[motor1StepPhase];
 }
 
-// 计算电机2的相位数据
 void calculatePhaseMotor2() {
-  if (motor2Direction) {
-    motor2Nibble = stepPatternHex[motor2StepPhase];
-  } else {
-    motor2Nibble = stepPatternHexRev[motor2StepPhase];
-  }
+  if (motor2Direction) motor2Nibble = stepPatternHex[motor2StepPhase];
+  else motor2Nibble = stepPatternHexRev[motor2StepPhase];
 }
 
 void startMotor1() {
@@ -217,7 +196,7 @@ void startMotor1() {
   motor1RevolutionCount++;
   motor1StepCycle = 0;
   motor1StepPhase = 0;
-  motor1TargetSteps = STEPS_PER_REVOLUTION;
+  motor1TargetSteps = nextTargetSteps1; // 使用可变目标
   motor1Running = true;
 }
 
@@ -226,49 +205,73 @@ void startMotor2() {
   motor2RevolutionCount++;
   motor2StepCycle = 0;
   motor2StepPhase = 0;
-  motor2TargetSteps = STEPS_PER_REVOLUTION;
+  motor2TargetSteps = nextTargetSteps2; // 使用可变目标
   motor2Running = true;
 }
 
-// 电机1 完成一圈
+// 电机1 完成
 void finishRevolutionMotor1() {
   motor1Running = false;
-  motor1Enabled = false; // 关闭使能
-  stopMotor1();          // 断电
+  // 对于指令3，电机1做完第一阶段就彻底结束了
+  motor1Enabled = false; 
+  stopMotor1();          
   updateShiftRegister(); 
 }
 
-// 电机2 完成一圈
+// 电机2 完成 (核心逻辑在这里)
 void finishRevolutionMotor2() {
   motor2Running = false;
+  
+  // === 处理指令3的特殊逻辑 ===
+  if (command3Status == 1) {
+    // 刚完成了阶段一 (逆转1圈)
+    // 现在进入阶段二 (正转0.4圈)
+    
+    // 1. 设置状态为阶段二
+    command3Status = 2;
+    
+    // 2. 改变方向为正转
+    motor2Direction = true;
+    
+    // 3. 改变目标步数为 200 (500 * 0.4)
+    nextTargetSteps2 = 200; 
+    
+    // 4. 保持使能状态 (motor2Enabled 依然是 true)
+    // 这样在下一个 loop() 循环中，startMotor2() 会被再次调用
+    // 并使用新的方向和步数
+    
+    Serial.println("CMD3: Phase 1 Done. Starting Phase 2 (M2 Fwd 200)");
+    
+    // 为了防止惯性或显示效果，可以在这里强制先发一次停止波形，再立刻开始下一次
+    stopMotor2();
+    updateShiftRegister();
+    return; // 直接返回，不执行下面的关闭代码
+  }
+  
+  // === 普通逻辑 (或者指令3的阶段二完成) ===
+  if (command3Status == 2) {
+      Serial.println("CMD3: All Done");
+      command3Status = 0; // 重置状态
+  }
+
   motor2Enabled = false; // 关闭使能
   stopMotor2();          // 断电
   updateShiftRegister(); 
 }
 
-void stopMotor1() {
-  motor1Nibble = 0x00; 
-}
-
-void stopMotor2() {
-  motor2Nibble = 0x00; 
-}
+void stopMotor1() { motor1Nibble = 0x00; }
+void stopMotor2() { motor2Nibble = 0x00; }
 
 // ================= RS485 通信 =================
 
 void sendHex485(byte data[8]) {
-  digitalWrite(DE_RE_Pin, HIGH); // 发送模式
+  digitalWrite(DE_RE_Pin, HIGH);
   delayMicroseconds(20);
   Serial1.write(data, 8);
   Serial1.flush();
   delayMicroseconds(20);
-  digitalWrite(DE_RE_Pin, LOW); // 接收模式
-
-  Serial.print("Sent: ");
-  for (int i = 0; i < 8; i++) {
-    Serial.print(data[i], HEX); Serial.print(" ");
-  }
-  Serial.println();
+  digitalWrite(DE_RE_Pin, LOW);
+  Serial.println("Ack Sent");
 }
 
 void handleRS485Commands() {
@@ -279,17 +282,10 @@ void handleRS485Commands() {
       rs485Index = 1;
       unsigned long startTime = millis();
       while (rs485Index < 8) {
-        if (Serial1.available()) {
-          rs485Buffer[rs485Index++] = Serial1.read();
-        }
-        if (millis() - startTime > 20) {
-          rs485Index = 0;
-          return;
-        }
+        if (Serial1.available()) rs485Buffer[rs485Index++] = Serial1.read();
+        if (millis() - startTime > 20) { rs485Index = 0; return; }
       }
-      if (rs485Index == 8) {
-        processHexCommand(rs485Buffer);
-      }
+      if (rs485Index == 8) processHexCommand(rs485Buffer);
       rs485Index = 0;
     }
   }
@@ -297,72 +293,71 @@ void handleRS485Commands() {
 
 void processHexCommand(byte cmd[8]) {
   if (cmd[0] != 0xEE) return;
+  
+  // 每次收到新指令，先重置所有特殊状态和步数
+  command3Status = 0;
+  nextTargetSteps1 = STEPS_PER_REVOLUTION; // 默认500
+  nextTargetSteps2 = STEPS_PER_REVOLUTION; // 默认500
 
-  // 1. 检查是否是 指令① (01 00 00 00)
-  // 动作：M1 反转，M2 正转
+  // 指令①: M1逆 M2正
   if (memcmp(cmd, cmdAction1, 8) == 0) {
-    // 复位状态
-    motor1Running = false; 
-    motor2Running = false;
-    
-    // 设置方向
-    motor1Direction = false; // M1 反转 (修改点)
-    motor2Direction = true;  // M2 正转 (修改点)
-    
-    // 启动
-    motor1Enabled = true;   
-    motor2Enabled = true;   
-    
-    Serial.println("CMD 1: M1 Rev, M2 Fwd");
+    motor1Running = false; motor2Running = false;
+    motor1Direction = false; // 逆
+    motor2Direction = true;  // 正
+    motor1Enabled = true; motor2Enabled = true;
     sendHex485(cmd);
   }
-  // 2. 检查是否是 指令② (02 00 00 00)
-  // 动作：M1 反转，M2 反转
+  // 指令②: 全逆
   else if (memcmp(cmd, cmdAction2, 8) == 0) {
-    // 复位状态
-    motor1Running = false;
-    motor2Running = false;
-    
-    // 设置方向
-    motor1Direction = false; // M1 反转
-    motor2Direction = false; // M2 反转
-    
-    // 启动
-    motor1Enabled = true;    
-    motor2Enabled = true;    
-    
-    Serial.println("CMD 2: All Backward");
+    motor1Running = false; motor2Running = false;
+    motor1Direction = false; // 逆
+    motor2Direction = false; // 逆
+    motor1Enabled = true; motor2Enabled = true;
     sendHex485(cmd);
   }
-  // 3. 原有单独控制指令 (单M1正转)
+  // 【新增】指令③: 复合动作
+  else if (memcmp(cmd, cmdAction3, 8) == 0) {
+    motor1Running = false; motor2Running = false;
+    
+    // 阶段一配置
+    command3Status = 1;      // 标记为指令3阶段1
+    motor1Direction = false; // 逆
+    motor2Direction = false; // 逆
+    
+    // 步数保持默认500 (1圈)
+    nextTargetSteps1 = 500;
+    nextTargetSteps2 = 500;
+    
+    motor1Enabled = true; 
+    motor2Enabled = true;
+    
+    Serial.println("CMD3: Start Phase 1 (All Rev)");
+    sendHex485(cmd);
+  }
+  // 单独控制 M1 正
   else if (memcmp(cmd, motor1OnCmd, 8) == 0) {
     motor1Running = false;
-    motor1Direction = true; // 正转
+    motor1Direction = true;
     motor1Enabled = true;
-    Serial.println("CMD: M1 Forward");
     sendHex485(cmd);
   }
+  // M1 停
   else if (memcmp(cmd, motor1OffCmd, 8) == 0) {
-    motor1Enabled = false;
-    motor1Running = false;
-    stopMotor1();
-    updateShiftRegister(); 
-    Serial.println("CMD: Stop M1");
+    motor1Enabled = false; motor1Running = false;
+    stopMotor1(); updateShiftRegister();
     sendHex485(cmd);
   }
+  // 单独控制 M2 正
   else if (memcmp(cmd, motor2OnCmd, 8) == 0) {
     motor2Running = false;
-    motor2Direction = true; // 正转
+    motor2Direction = true;
     motor2Enabled = true;
-    Serial.println("CMD: M2 Forward");
     sendHex485(cmd);
   }
+  // M2 停
   else if (memcmp(cmd, motor2OffCmd, 8) == 0) {
-    motor2Enabled = false;
-    motor2Running = false;
-    stopMotor2();
-    updateShiftRegister(); 
-    Serial.println("CMD: Stop M2");
+    motor2Enabled = false; motor2Running = false;
+    stopMotor2(); updateShiftRegister();
     sendHex485(cmd);
   }
 }
