@@ -62,7 +62,6 @@ volatile bool targetStateMacerator = false;
 // --- [新增] 水即热装置移相调压控制 ---
 volatile uint16_t heaterDelayMicros = 0;  // 延时时间(微秒)，0=关闭，100=立即触发(100%)
 volatile bool heaterTriggerEnabled = false; // 是否启用加热器
-HardwareTimer *timer2 = NULL;  // 定时器2用于延时触发
 
 // --- 步进电机相关变量 ---
 byte currentShiftOutput = 0; // 595当前的输出字节
@@ -163,6 +162,9 @@ void heaterTimerCallback() {
   digitalWrite(PIN_HEATER, LOW);
   delayMicroseconds(100);
   digitalWrite(PIN_HEATER, HIGH);
+
+  // 停止定时器，等待下次过零触发
+  timer_pause(TIMER2);
 }
 
 // ================= 7. Setup 初始化 =================
@@ -212,12 +214,13 @@ void setup() {
   pinMode(PIN_VALVE3, OUTPUT);
   digitalWrite(PIN_VALVE3, LOW); // 默认关闭
 
-  // --- [关键] 配置硬件定时器TIM2用于水即热延时触发 ---
-  TIM_TypeDef *Instance = TIM2;
-  timer2 = new HardwareTimer(Instance);
-  timer2->setMode(1, TIMER_OUTPUT_COMPARE);
-  timer2->attachInterrupt(heaterTimerCallback);
-  timer2->setOverflow(10000, MICROSEC_FORMAT); // 最大10ms
+  // --- [关键] 配置定时器2用于水即热延时触发 ---
+  // 使用libmaple原生API配置定时器
+  timer_pause(TIMER2);
+  timer_set_prescaler(TIMER2, 71); // 72MHz / (71+1) = 1MHz，即1微秒计数
+  timer_set_mode(TIMER2, TIMER_CH1, TIMER_OUTPUT_COMPARE);
+  timer_set_reload(TIMER2, 10000); // 默认10ms
+  timer_attach_interrupt(TIMER2, TIMER_CH1, heaterTimerCallback);
   // 注意：不在这里启动定时器，而是在过零中断中按需启动
 
   // --- [关键] 开启 PA0 过零检测中断 ---
@@ -266,10 +269,10 @@ void zeroCrossingISR() {
     // 确保PA3为高电平（可控硅关断状态）
     digitalWrite(PIN_HEATER, HIGH);
 
-    // 启动定时器，延时后触发
-    timer2->setOverflow(heaterDelayMicros, MICROSEC_FORMAT);
-    timer2->refresh();
-    timer2->resume();
+    // 设置定时器延时时间并启动
+    timer_set_reload(TIMER2, heaterDelayMicros);
+    timer_set_count(TIMER2, 0); // 重置计数器
+    timer_resume(TIMER2); // 启动定时器
   } else {
     // 关闭状态：保持高电平
     digitalWrite(PIN_HEATER, HIGH);
