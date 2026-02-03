@@ -47,6 +47,14 @@
 #define PIN_VALVE2     PB11 // 电磁阀2
 #define PIN_VALVE3     PB12 // 电磁阀3
 
+// NTC温度传感器
+#define NTC_PIN PB0          // NTC连接到PB0 (ADC输入)
+#define SERIES_RESISTOR 10000 // 上拉电阻10kΩ
+#define NTC_NOMINAL 10000     // NTC标称阻值10kΩ (25°C时)
+#define TEMPERATURE_NOMINAL 25   // 标称温度25°C
+#define B_COEFFICIENT 3950    // NTC的B值系数
+#define ADC_RESOLUTION 4095   // STM32的12位ADC分辨率
+
 // ================= 2. 参数设置 =================
 #define STEPS_PER_REVOLUTION 500  // 电机转一圈的步数 (根据实际电机调整)
 #define STEP_DELAY 5              // 步进速度 (毫秒/步)
@@ -62,6 +70,11 @@ volatile bool targetStateMacerator = false;
 // --- [新增] 水即热装置移相调压控制 ---
 volatile uint16_t heaterDelayMicros = 0;  // 延时时间(微秒)，0=关闭，100=立即触发(100%)
 volatile bool heaterTriggerEnabled = false; // 是否启用加热器
+
+// --- 温度监控相关变量 ---
+float currentTemperature = 0.0;
+unsigned long lastTempTime = 0;    // 上次温度更新时间
+unsigned long lastUploadTime = 0;  // 上次温度上传时间
 
 // --- 步进电机相关变量 ---
 byte currentShiftOutput = 0; // 595当前的输出字节
@@ -154,6 +167,9 @@ void handleStepperMotor(unsigned long currentTime);
 void handleRS485Commands();
 void processHexCommand(byte cmd[8]);
 void sendHex485(byte data[8]);
+float readTemperature(); // 温度读取函数
+void temperatureToTwoBytes(float temp, byte &highByte, byte &lowByte); // 温度转换函数
+void uploadTemperatureData(); // 温度上传函数
 
 // ================= 6. 定时器回调函数 =================
 // 定时器中断：延时后触发可控硅
@@ -214,6 +230,10 @@ void setup() {
   pinMode(PIN_VALVE3, OUTPUT);
   digitalWrite(PIN_VALVE3, LOW); // 默认关闭
 
+  // --- 初始化ADC用于NTC温度读取 ---
+  pinMode(NTC_PIN, INPUT_ANALOG);
+  Serial.println("NTC Temperature Sensor Initialized");
+
   // --- [关键] 配置定时器2用于水即热延时触发 ---
   // 使用libmaple原生API配置定时器
   timer_pause(TIMER2);
@@ -248,11 +268,28 @@ void setup() {
 
 // ================= 7. 主循环 =================
 void loop() {
+  unsigned long currentTime = millis();
+
   // 步进电机是非阻塞的，需要不断调用
-  handleStepperMotor(millis());
-  
+  handleStepperMotor(currentTime);
+
   // 检查 RS485 指令
   handleRS485Commands();
+
+  // 温度读取 (每2秒)
+  if(currentTime - lastTempTime >= 2000) {
+    currentTemperature = readTemperature();
+    lastTempTime = currentTime;
+    Serial.print("Current Temperature: ");
+    Serial.print(currentTemperature, 1);
+    Serial.println(" C");
+  }
+
+  // 温度数据上传 (每5秒)
+  if(currentTime - lastUploadTime >= 5000) {
+    uploadTemperatureData();
+    lastUploadTime = currentTime;
+  }
 }
 
 // ================= 8. 中断服务函数 (ISR) =================
@@ -626,10 +663,61 @@ void finishRevolutionMotor2() {
       command3Status = 0; 
   }
 
-  motor2Enabled = false; 
-  stopMotor2();          
-  updateShiftRegister(); 
+  motor2Enabled = false;
+  stopMotor2();
+  updateShiftRegister();
 }
 
 void stopMotor1() { motor1Nibble = 0x00; }
 void stopMotor2() { motor2Nibble = 0x00; }
+
+// ================= 11. 温度监控功能 =================
+
+// 读取NTC温度传感器
+float readTemperature() {
+  int adcValue = analogRead(NTC_PIN);
+
+  // 计算NTC电阻值
+  float resistance = SERIES_RESISTOR / ((ADC_RESOLUTION / (float)adcValue) - 1);
+
+  // 使用Steinhart-Hart方程计算温度
+  float steinhart;
+  steinhart = resistance / NTC_NOMINAL;     // (R/Ro)
+  steinhart = log(steinhart);               // ln(R/Ro)
+  steinhart /= B_COEFFICIENT;               // 1/B * ln(R/Ro)
+  steinhart += 1.0 / (TEMPERATURE_NOMINAL + 273.15); // + (1/To)
+  steinhart = 1.0 / steinhart;              // 倒数
+  steinhart -= 273.15;                      // 转换为摄氏度
+
+  return steinhart;
+}
+
+// 温度值转换为补码的辅助函数
+void temperatureToTwoBytes(float temp, byte &highByte, byte &lowByte) {
+  int16_t tempInt = (int16_t)(temp * 10);  // 温度×10,转为整数
+  highByte = (tempInt >> 8) & 0xFF;         // 高字节
+  lowByte = tempInt & 0xFF;                 // 低字节
+}
+
+// 温度数据上传函数
+void uploadTemperatureData() {
+  // 构建8字节十六进制温度数据帧
+  // 格式: EE 10 00 01 00 01 [温度高字节] [温度低字节]
+  byte tempFrame[8];
+  tempFrame[0] = 0xEE;
+  tempFrame[1] = 0x10;
+  tempFrame[2] = 0x00;
+  tempFrame[3] = 0x01;
+  tempFrame[4] = 0x00;
+  tempFrame[5] = 0x01;
+
+  // 将温度转换为补码形式的两个字节
+  temperatureToTwoBytes(currentTemperature, tempFrame[6], tempFrame[7]);
+
+  // 通过RS485发送温度数据
+  sendHex485(tempFrame);
+
+  Serial.print("Temperature uploaded: ");
+  Serial.print(currentTemperature, 1);
+  Serial.println(" C");
+}
