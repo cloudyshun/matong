@@ -57,8 +57,12 @@
 // true = 开启(输出低电平), false = 关闭(输出高电平)
 volatile bool targetStateFan = false;
 volatile bool targetStatePump = false;
-volatile bool targetStateHeater = false;
 volatile bool targetStateMacerator = false;
+
+// --- [新增] 水即热装置移相调压控制 ---
+volatile uint16_t heaterDelayMicros = 0;  // 延时时间(微秒)，0=关闭，100=立即触发(100%)
+volatile bool heaterTriggerEnabled = false; // 是否启用加热器
+HardwareTimer *timer2 = NULL;  // 定时器2用于延时触发
 
 // --- 步进电机相关变量 ---
 byte currentShiftOutput = 0; // 595当前的输出字节
@@ -115,8 +119,6 @@ const byte cmdFanOn[8]   = {0xEE, 0x01, 0x00, 0x01, 0x00, 0x01, 0x01, 0x00}; // 
 const byte cmdFanOff[8]  = {0xEE, 0x01, 0x00, 0x01, 0x00, 0x01, 0x01, 0x01}; // 风扇关
 const byte cmdPumpOn[8]  = {0xEE, 0x01, 0x00, 0x01, 0x00, 0x01, 0x02, 0x00}; // 水泵开
 const byte cmdPumpOff[8] = {0xEE, 0x01, 0x00, 0x01, 0x00, 0x01, 0x02, 0x01}; // 水泵关
-const byte cmdHeatOn[8]  = {0xEE, 0x01, 0x00, 0x01, 0x00, 0x01, 0x03, 0x00}; // 加热开
-const byte cmdHeatOff[8] = {0xEE, 0x01, 0x00, 0x01, 0x00, 0x01, 0x03, 0x01}; // 加热关
 const byte cmdMacOn[8]   = {0xEE, 0x01, 0x00, 0x01, 0x00, 0x01, 0x04, 0x00}; // 粉碎开
 const byte cmdMacOff[8]  = {0xEE, 0x01, 0x00, 0x01, 0x00, 0x01, 0x04, 0x01}; // 粉碎关
 const byte cmdDryFanOn[8]  = {0xEE, 0x01, 0x00, 0x01, 0x00, 0x01, 0x05, 0x00}; // 烘干风扇开
@@ -130,9 +132,20 @@ const byte cmdValve2Off[8] = {0xEE, 0x01, 0x00, 0x01, 0x00, 0x01, 0x08, 0x01}; /
 const byte cmdValve3On[8]  = {0xEE, 0x01, 0x00, 0x01, 0x00, 0x01, 0x09, 0x00}; // 电磁阀3开
 const byte cmdValve3Off[8] = {0xEE, 0x01, 0x00, 0x01, 0x00, 0x01, 0x09, 0x01}; // 电磁阀3关
 
+// 水即热功率控制指令 (使用原来的加热指令，但增加功率等级)
+// 格式: 0xEE, 0x01, 0x00, 0x01, 0x00, 0x01, 0x03, [功率等级]
+// 功率等级: 0x00=关闭, 0x01=20%, 0x02=40%, 0x03=60%, 0x04=80%, 0x05=100%
+const byte cmdHeatOff_New[8]  = {0xEE, 0x01, 0x00, 0x01, 0x00, 0x01, 0x03, 0x00}; // 加热关
+const byte cmdHeat20[8]   = {0xEE, 0x01, 0x00, 0x01, 0x00, 0x01, 0x03, 0x01}; // 20%功率
+const byte cmdHeat40[8]   = {0xEE, 0x01, 0x00, 0x01, 0x00, 0x01, 0x03, 0x02}; // 40%功率
+const byte cmdHeat60[8]   = {0xEE, 0x01, 0x00, 0x01, 0x00, 0x01, 0x03, 0x03}; // 60%功率
+const byte cmdHeat80[8]   = {0xEE, 0x01, 0x00, 0x01, 0x00, 0x01, 0x03, 0x04}; // 80%功率
+const byte cmdHeat100[8]  = {0xEE, 0x01, 0x00, 0x01, 0x00, 0x01, 0x03, 0x05}; // 100%功率
+
 
 // ================= 5. 函数声明 =================
 void zeroCrossingISR(); // 中断服务函数
+void heaterTimerCallback(); // 定时器回调函数
 void updateShiftRegister();
 void stopMotor1(); void stopMotor2();
 void startMotor1(); void startMotor2();
@@ -143,7 +156,16 @@ void handleRS485Commands();
 void processHexCommand(byte cmd[8]);
 void sendHex485(byte data[8]);
 
-// ================= 6. Setup 初始化 =================
+// ================= 6. 定时器回调函数 =================
+// 定时器中断：延时后触发可控硅
+void heaterTimerCallback() {
+  // 输出100微秒的低电平脉冲触发可控硅
+  digitalWrite(PIN_HEATER, LOW);
+  delayMicroseconds(100);
+  digitalWrite(PIN_HEATER, HIGH);
+}
+
+// ================= 7. Setup 初始化 =================
 void setup() {
   // 调试串口 (USB)
   Serial.begin(9600);
@@ -190,6 +212,14 @@ void setup() {
   pinMode(PIN_VALVE3, OUTPUT);
   digitalWrite(PIN_VALVE3, LOW); // 默认关闭
 
+  // --- [关键] 配置硬件定时器TIM2用于水即热延时触发 ---
+  TIM_TypeDef *Instance = TIM2;
+  timer2 = new HardwareTimer(Instance);
+  timer2->setMode(1, TIMER_OUTPUT_COMPARE);
+  timer2->attachInterrupt(heaterTimerCallback);
+  timer2->setOverflow(10000, MICROSEC_FORMAT); // 最大10ms
+  // 注意：不在这里启动定时器，而是在过零中断中按需启动
+
   // --- [关键] 开启 PA0 过零检测中断 ---
   // PA0 连接光耦，平时高电平，过零时低电平。
   // 检测下降沿 (FALLING) 代表进入过零点。
@@ -226,11 +256,24 @@ void loop() {
 // 只要交流电有电，该函数每 10ms (50Hz) 会自动执行一次
 // 作用：将 targetState 的状态应用到 IO 口，实现过零开关
 void zeroCrossingISR() {
-  // 写入物理引脚 (低电平有效)
+  // 其他强电负载：立即在过零点切换 (低电平有效)
   digitalWrite(PIN_FAN,       targetStateFan       ? LOW : HIGH);
   digitalWrite(PIN_PUMP,      targetStatePump      ? LOW : HIGH);
-  digitalWrite(PIN_HEATER,    targetStateHeater    ? LOW : HIGH);
   digitalWrite(PIN_MACERATOR, targetStateMacerator ? LOW : HIGH);
+
+  // 水即热装置：使用移相调压控制
+  if (heaterTriggerEnabled && heaterDelayMicros > 0) {
+    // 确保PA3为高电平（可控硅关断状态）
+    digitalWrite(PIN_HEATER, HIGH);
+
+    // 启动定时器，延时后触发
+    timer2->setOverflow(heaterDelayMicros, MICROSEC_FORMAT);
+    timer2->refresh();
+    timer2->resume();
+  } else {
+    // 关闭状态：保持高电平
+    digitalWrite(PIN_HEATER, HIGH);
+  }
 }
 
 // ================= 9. RS485 通信处理 =================
@@ -306,18 +349,44 @@ void processHexCommand(byte cmd[8]) {
     sendHex485(cmd); return;
   }
   
-  // 3. 水即热控制
-  else if (memcmp(cmd, cmdHeatOn, 8) == 0) {
-    targetStateHeater = true;
-    Serial.println("CMD: Heater ON (Wait ZC)");
+  // 3. 水即热控制 (新版：支持功率调节)
+  else if (memcmp(cmd, cmdHeatOff_New, 8) == 0) {
+    heaterTriggerEnabled = false;
+    heaterDelayMicros = 0;
+    Serial.println("CMD: Heater OFF");
     sendHex485(cmd); return;
   }
-  else if (memcmp(cmd, cmdHeatOff, 8) == 0) {
-    targetStateHeater = false;
-    Serial.println("CMD: Heater OFF (Wait ZC)");
+  else if (memcmp(cmd, cmdHeat20, 8) == 0) {
+    heaterTriggerEnabled = true;
+    heaterDelayMicros = 8000; // 延时8ms，导通2ms，功率约20%
+    Serial.println("CMD: Heater 20%");
     sendHex485(cmd); return;
   }
-  
+  else if (memcmp(cmd, cmdHeat40, 8) == 0) {
+    heaterTriggerEnabled = true;
+    heaterDelayMicros = 6000; // 延时6ms，导通4ms，功率约40%
+    Serial.println("CMD: Heater 40%");
+    sendHex485(cmd); return;
+  }
+  else if (memcmp(cmd, cmdHeat60, 8) == 0) {
+    heaterTriggerEnabled = true;
+    heaterDelayMicros = 4000; // 延时4ms，导通6ms，功率约60%
+    Serial.println("CMD: Heater 60%");
+    sendHex485(cmd); return;
+  }
+  else if (memcmp(cmd, cmdHeat80, 8) == 0) {
+    heaterTriggerEnabled = true;
+    heaterDelayMicros = 2000; // 延时2ms，导通8ms，功率约80%
+    Serial.println("CMD: Heater 80%");
+    sendHex485(cmd); return;
+  }
+  else if (memcmp(cmd, cmdHeat100, 8) == 0) {
+    heaterTriggerEnabled = true;
+    heaterDelayMicros = 100; // 几乎立即触发，功率约100%
+    Serial.println("CMD: Heater 100%");
+    sendHex485(cmd); return;
+  }
+
   // 4. 粉碎泵控制
   else if (memcmp(cmd, cmdMacOn, 8) == 0) {
     targetStateMacerator = true;
