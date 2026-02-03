@@ -40,6 +40,13 @@
 // RS485
 #define DE_RE_Pin      PA8
 
+// 继电器控制引脚
+#define PIN_DRY_FAN    PB8  // 烘干风扇
+#define PIN_DEODOR_FAN PB9  // 除臭风扇
+#define PIN_VALVE1     PB10 // 电磁阀1
+#define PIN_VALVE2     PB11 // 电磁阀2
+#define PIN_VALVE3     PB12 // 电磁阀3
+
 // ================= 2. 参数设置 =================
 #define STEPS_PER_REVOLUTION 500  // 电机转一圈的步数 (根据实际电机调整)
 #define STEP_DELAY 5              // 步进速度 (毫秒/步)
@@ -112,6 +119,16 @@ const byte cmdHeatOn[8]  = {0xEE, 0x01, 0x00, 0x01, 0x00, 0x01, 0x03, 0x00}; // 
 const byte cmdHeatOff[8] = {0xEE, 0x01, 0x00, 0x01, 0x00, 0x01, 0x03, 0x01}; // 加热关
 const byte cmdMacOn[8]   = {0xEE, 0x01, 0x00, 0x01, 0x00, 0x01, 0x04, 0x00}; // 粉碎开
 const byte cmdMacOff[8]  = {0xEE, 0x01, 0x00, 0x01, 0x00, 0x01, 0x04, 0x01}; // 粉碎关
+const byte cmdDryFanOn[8]  = {0xEE, 0x01, 0x00, 0x01, 0x00, 0x01, 0x05, 0x00}; // 烘干风扇开
+const byte cmdDryFanOff[8] = {0xEE, 0x01, 0x00, 0x01, 0x00, 0x01, 0x05, 0x01}; // 烘干风扇关
+const byte cmdDeodorFanOn[8]  = {0xEE, 0x01, 0x00, 0x01, 0x00, 0x01, 0x06, 0x00}; // 除臭风扇开
+const byte cmdDeodorFanOff[8] = {0xEE, 0x01, 0x00, 0x01, 0x00, 0x01, 0x06, 0x01}; // 除臭风扇关
+const byte cmdValve1On[8]  = {0xEE, 0x01, 0x00, 0x01, 0x00, 0x01, 0x07, 0x00}; // 电磁阀1开
+const byte cmdValve1Off[8] = {0xEE, 0x01, 0x00, 0x01, 0x00, 0x01, 0x07, 0x01}; // 电磁阀1关
+const byte cmdValve2On[8]  = {0xEE, 0x01, 0x00, 0x01, 0x00, 0x01, 0x08, 0x00}; // 电磁阀2开
+const byte cmdValve2Off[8] = {0xEE, 0x01, 0x00, 0x01, 0x00, 0x01, 0x08, 0x01}; // 电磁阀2关
+const byte cmdValve3On[8]  = {0xEE, 0x01, 0x00, 0x01, 0x00, 0x01, 0x09, 0x00}; // 电磁阀3开
+const byte cmdValve3Off[8] = {0xEE, 0x01, 0x00, 0x01, 0x00, 0x01, 0x09, 0x01}; // 电磁阀3关
 
 
 // ================= 5. 函数声明 =================
@@ -154,8 +171,24 @@ void setup() {
   pinMode(PIN_HEATER, OUTPUT); 
   digitalWrite(PIN_HEATER, HIGH);
   
-  pinMode(PIN_MACERATOR, OUTPUT); 
+  pinMode(PIN_MACERATOR, OUTPUT);
   digitalWrite(PIN_MACERATOR, HIGH);
+
+  // --- 继电器控制引脚初始化 ---
+  pinMode(PIN_DRY_FAN, OUTPUT);
+  digitalWrite(PIN_DRY_FAN, LOW); // 默认关闭
+
+  pinMode(PIN_DEODOR_FAN, OUTPUT);
+  digitalWrite(PIN_DEODOR_FAN, LOW); // 默认关闭
+
+  pinMode(PIN_VALVE1, OUTPUT);
+  digitalWrite(PIN_VALVE1, LOW); // 默认关闭
+
+  pinMode(PIN_VALVE2, OUTPUT);
+  digitalWrite(PIN_VALVE2, LOW); // 默认关闭
+
+  pinMode(PIN_VALVE3, OUTPUT);
+  digitalWrite(PIN_VALVE3, LOW); // 默认关闭
 
   // --- [关键] 开启 PA0 过零检测中断 ---
   // PA0 连接光耦，平时高电平，过零时低电平。
@@ -294,6 +327,66 @@ void processHexCommand(byte cmd[8]) {
   else if (memcmp(cmd, cmdMacOff, 8) == 0) {
     targetStateMacerator = false;
     Serial.println("CMD: Macerator OFF (Wait ZC)");
+    sendHex485(cmd); return;
+  }
+
+  // 5. 烘干风扇控制
+  else if (memcmp(cmd, cmdDryFanOn, 8) == 0) {
+    digitalWrite(PIN_DRY_FAN, HIGH);
+    Serial.println("CMD: Dry Fan ON");
+    sendHex485(cmd); return;
+  }
+  else if (memcmp(cmd, cmdDryFanOff, 8) == 0) {
+    digitalWrite(PIN_DRY_FAN, LOW);
+    Serial.println("CMD: Dry Fan OFF");
+    sendHex485(cmd); return;
+  }
+
+  // 6. 除臭风扇控制
+  else if (memcmp(cmd, cmdDeodorFanOn, 8) == 0) {
+    digitalWrite(PIN_DEODOR_FAN, HIGH);
+    Serial.println("CMD: Deodorizing Fan ON");
+    sendHex485(cmd); return;
+  }
+  else if (memcmp(cmd, cmdDeodorFanOff, 8) == 0) {
+    digitalWrite(PIN_DEODOR_FAN, LOW);
+    Serial.println("CMD: Deodorizing Fan OFF");
+    sendHex485(cmd); return;
+  }
+
+  // 7. 电磁阀1控制
+  else if (memcmp(cmd, cmdValve1On, 8) == 0) {
+    digitalWrite(PIN_VALVE1, HIGH);
+    Serial.println("CMD: Valve 1 ON");
+    sendHex485(cmd); return;
+  }
+  else if (memcmp(cmd, cmdValve1Off, 8) == 0) {
+    digitalWrite(PIN_VALVE1, LOW);
+    Serial.println("CMD: Valve 1 OFF");
+    sendHex485(cmd); return;
+  }
+
+  // 8. 电磁阀2控制
+  else if (memcmp(cmd, cmdValve2On, 8) == 0) {
+    digitalWrite(PIN_VALVE2, HIGH);
+    Serial.println("CMD: Valve 2 ON");
+    sendHex485(cmd); return;
+  }
+  else if (memcmp(cmd, cmdValve2Off, 8) == 0) {
+    digitalWrite(PIN_VALVE2, LOW);
+    Serial.println("CMD: Valve 2 OFF");
+    sendHex485(cmd); return;
+  }
+
+  // 9. 电磁阀3控制
+  else if (memcmp(cmd, cmdValve3On, 8) == 0) {
+    digitalWrite(PIN_VALVE3, HIGH);
+    Serial.println("CMD: Valve 3 ON");
+    sendHex485(cmd); return;
+  }
+  else if (memcmp(cmd, cmdValve3Off, 8) == 0) {
+    digitalWrite(PIN_VALVE3, LOW);
+    Serial.println("CMD: Valve 3 OFF");
     sendHex485(cmd); return;
   }
 
