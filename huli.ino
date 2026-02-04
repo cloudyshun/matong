@@ -85,6 +85,8 @@ int nextTargetSteps1 = STEPS_PER_REVOLUTION;
 int nextTargetSteps2 = STEPS_PER_REVOLUTION; 
 
 // 复合动作指令的状态机
+int command1Status = 0; // cmdAction1 状态标志
+int command2Status = 0; // cmdAction2 状态标志
 int command3Status = 0; 
 
 // 电机1 运行时参数
@@ -500,12 +502,15 @@ void processHexCommand(byte cmd[8]) {
   }
 
   // --- B. 步进电机控制指令 ---
-  
+
   // 收到新电机指令，先重置电机状态机
+  command1Status = 0;
+  command2Status = 0;
   command3Status = 0; 
   
   if (memcmp(cmd, cmdAction1, 8) == 0) {
     motor1Running = false; motor2Running = false;
+    command1Status = 1;      // 激活 cmdAction1 状态
     motor1Direction = false; // M1 逆
     motor2Direction = true;  // M2 正
     motor1Enabled = true; motor2Enabled = true;
@@ -513,6 +518,7 @@ void processHexCommand(byte cmd[8]) {
   }
   else if (memcmp(cmd, cmdAction2, 8) == 0) {
     motor1Running = false; motor2Running = false;
+    command2Status = 1;      // 激活 cmdAction2 状态
     motor1Direction = false; // M1 逆
     motor2Direction = false; // M2 逆
     motor1Enabled = true; motor2Enabled = true;
@@ -638,15 +644,23 @@ void startMotor2() {
 // 电机1 停止逻辑
 void finishRevolutionMotor1() {
   motor1Running = false;
-  motor1Enabled = false; 
-  stopMotor1();          
-  updateShiftRegister(); 
+  motor1Enabled = false;
+  stopMotor1();
+  updateShiftRegister();
+
+  // 检查是否是 cmdAction1 或 cmdAction2，且两个电机都已停止
+  if ((command1Status == 1 || command2Status == 1) && !motor1Running && !motor2Running) {
+    digitalWrite(PIN_VALVE3, HIGH); // 打开电磁阀3
+    Serial.println("CMD1/2: Both motors stopped, Valve 3 ON");
+    command1Status = 0; // 重置状态
+    command2Status = 0;
+  }
 }
 
 // 电机2 停止逻辑 (包含复杂动作 Command3)
 void finishRevolutionMotor2() {
   motor2Running = false;
-  
+
   // Command 3 特殊阶段处理
   if (command3Status == 1) {
     command3Status = 2;     // 进入阶段二
@@ -657,15 +671,30 @@ void finishRevolutionMotor2() {
     updateShiftRegister();
     return; // 退出，保持运行
   }
-  
+
   if (command3Status == 2) {
       Serial.println("CMD3: Done");
-      command3Status = 0; 
+      command3Status = 3; // 标记为完成状态，等待检查
   }
 
   motor2Enabled = false;
   stopMotor2();
   updateShiftRegister();
+
+  // 检查是否是 cmdAction1 或 cmdAction2，且两个电机都已停止
+  if ((command1Status == 1 || command2Status == 1) && !motor1Running && !motor2Running) {
+    digitalWrite(PIN_VALVE3, HIGH); // 打开电磁阀3
+    Serial.println("CMD1/2: Both motors stopped, Valve 3 ON");
+    command1Status = 0; // 重置状态
+    command2Status = 0;
+  }
+
+  // 检查是否是 cmdAction3 完成，且两个电机都已停止
+  if (command3Status == 3 && !motor1Running && !motor2Running) {
+    digitalWrite(PIN_VALVE3, HIGH); // 打开电磁阀3
+    Serial.println("CMD3: Both motors stopped, Valve 3 ON");
+    command3Status = 0; // 重置状态
+  }
 }
 
 void stopMotor1() { motor1Nibble = 0x00; }
