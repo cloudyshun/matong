@@ -56,7 +56,7 @@
 #define ADC_RESOLUTION 4095   // STM32的12位ADC分辨率
 
 // ================= 2. 参数设置 =================
-#define STEPS_PER_REVOLUTION 500  // 电机转一圈的步数 (根据实际电机调整)
+#define STEPS_PER_REVOLUTION 300  // 电机转一圈的步数 (根据实际电机调整)
 #define STEP_DELAY 5              // 步进速度 (毫秒/步)
 
 // ================= 3. 全局变量 =================
@@ -520,11 +520,11 @@ void processHexCommand(byte cmd[8]) {
   }
   else if (memcmp(cmd, cmdAction3, 8) == 0) {
     motor1Running = false; motor2Running = false;
-    command3Status = 1;      // 激活复合动作
-    motor1Direction = false; // M1 逆
-    motor2Direction = false; // M2 逆
-    nextTargetSteps1 = 500;  // 1圈
-    nextTargetSteps2 = 500;  // 1圈
+    command3Status = 1;      // 激活复合动作，进入阶段一
+    motor1Direction = true; // M1 顺时针转（缩回）
+    motor2Direction = true; // M2 顺时针转（缩回）
+    nextTargetSteps1 = 300;  // 1圈
+    nextTargetSteps2 = 300;  // 1圈
     motor1Enabled = true; motor2Enabled = true;
     sendHex485(cmd);
   }
@@ -650,8 +650,8 @@ void finishRevolutionMotor2() {
   // Command 3 特殊阶段处理
   if (command3Status == 1) {
     command3Status = 2;     // 进入阶段二
-    motor2Direction = true; // 变正转
-    nextTargetSteps2 = 200; // 0.4圈
+    motor2Direction = false; // 变反转
+    nextTargetSteps2 = 190; // 0.4圈
     startMotor2();          // 立即重启
     Serial.println("CMD3: Phase 2 Start");
     updateShiftRegister();
