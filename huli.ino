@@ -63,9 +63,12 @@
 
 // --- [核心] 强电负载的目标状态 (volatile 必不可少，因为在中断中读取) ---
 // true = 开启(输出低电平), false = 关闭(输出高电平)
-volatile bool targetStateFan = false;
 volatile bool targetStatePump = false;
 volatile bool targetStateMacerator = false;
+
+// --- [新增] 风扇加热丝移相调压控制 ---
+volatile uint16_t fanDelayMicros = 0;  // 延时时间(微秒)，0=关闭
+volatile bool fanTriggerEnabled = false; // 是否启用风扇加热丝
 
 // --- [新增] 水即热装置移相调压控制 ---
 volatile uint16_t heaterDelayMicros = 0;  // 延时时间(微秒)，0=关闭，100=立即触发(100%)
@@ -159,7 +162,8 @@ const byte cmdHeat100[8]  = {0xEE, 0x01, 0x00, 0x01, 0x00, 0x01, 0x03, 0x05}; //
 
 // ================= 5. 函数声明 =================
 void zeroCrossingISR(); // 中断服务函数
-void heaterTimerCallback(); // 定时器回调函数
+void heaterTimerCallback(); // 定时器回调函数（水即热）
+void fanTimerCallback(); // 定时器回调函数（风扇加热丝）
 void updateShiftRegister();
 void stopMotor1(); void stopMotor2();
 void startMotor1(); void startMotor2();
@@ -174,7 +178,7 @@ void temperatureToTwoBytes(float temp, byte &highByte, byte &lowByte); // 温度
 void uploadTemperatureData(); // 温度上传函数
 
 // ================= 6. 定时器回调函数 =================
-// 定时器中断：延时后触发可控硅
+// 定时器中断：延时后触发可控硅（水即热）
 void heaterTimerCallback() {
   // 输出100微秒的低电平脉冲触发可控硅
   digitalWrite(PIN_HEATER, LOW);
@@ -183,6 +187,17 @@ void heaterTimerCallback() {
 
   // 停止定时器，等待下次过零触发
   timer_pause(TIMER2);
+}
+
+// 定时器中断：延时后触发可控硅（风扇加热丝）
+void fanTimerCallback() {
+  // 输出100微秒的低电平脉冲触发可控硅
+  digitalWrite(PIN_FAN, LOW);
+  delayMicroseconds(100);
+  digitalWrite(PIN_FAN, HIGH);
+
+  // 停止定时器，等待下次过零触发
+  timer_pause(TIMER3);
 }
 
 // ================= 7. Setup 初始化 =================
@@ -245,6 +260,14 @@ void setup() {
   timer_attach_interrupt(TIMER2, TIMER_CH1, heaterTimerCallback);
   // 注意：不在这里启动定时器，而是在过零中断中按需启动
 
+  // --- [关键] 配置定时器3用于风扇加热丝延时触发 ---
+  timer_pause(TIMER3);
+  timer_set_prescaler(TIMER3, 71); // 72MHz / (71+1) = 1MHz，即1微秒计数
+  timer_set_mode(TIMER3, TIMER_CH1, TIMER_OUTPUT_COMPARE);
+  timer_set_reload(TIMER3, 10000); // 默认10ms
+  timer_attach_interrupt(TIMER3, TIMER_CH1, fanTimerCallback);
+  // 注意：不在这里启动定时器，而是在过零中断中按需启动
+
   // --- [关键] 开启 PA0 过零检测中断 ---
   // PA0 连接光耦，平时高电平，过零时低电平。
   // 检测下降沿 (FALLING) 代表进入过零点。
@@ -298,8 +321,21 @@ void loop() {
 // 只要交流电有电，该函数每 10ms (50Hz) 会自动执行一次
 // 作用：将 targetState 的状态应用到 IO 口，实现过零开关
 void zeroCrossingISR() {
+  // 风扇加热丝：使用移相调压控制
+  if (fanTriggerEnabled && fanDelayMicros > 0) {
+    // 确保PA1为高电平（可控硅关断状态）
+    digitalWrite(PIN_FAN, HIGH);
+
+    // 设置定时器延时时间并启动
+    timer_set_reload(TIMER3, fanDelayMicros);
+    timer_set_count(TIMER3, 0); // 重置计数器
+    timer_resume(TIMER3); // 启动定时器
+  } else {
+    // 关闭状态：保持高电平
+    digitalWrite(PIN_FAN, HIGH);
+  }
+
   // 其他强电负载：立即在过零点切换 (低电平有效)
-  digitalWrite(PIN_FAN,       targetStateFan       ? LOW : HIGH);
   digitalWrite(PIN_PUMP,      targetStatePump      ? LOW : HIGH);
   digitalWrite(PIN_MACERATOR, targetStateMacerator ? LOW : HIGH);
 
@@ -369,12 +405,14 @@ void processHexCommand(byte cmd[8]) {
   
   // 1. 风扇控制
   if (memcmp(cmd, cmdFanOn, 8) == 0) {
-    targetStateFan = true;
-    Serial.println("CMD: Fan ON (Wait ZC)");
+    fanTriggerEnabled = true;
+    fanDelayMicros = 8000; // 延时8ms，导通2ms，功率约20%
+    Serial.println("CMD: Fan ON 20% (Wait ZC)");
     sendHex485(cmd); return;
   }
   else if (memcmp(cmd, cmdFanOff, 8) == 0) {
-    targetStateFan = false;
+    fanTriggerEnabled = false;
+    fanDelayMicros = 0;
     Serial.println("CMD: Fan OFF (Wait ZC)");
     sendHex485(cmd); return;
   }
