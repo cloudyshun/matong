@@ -558,10 +558,10 @@ void processHexCommand(byte cmd[8]) {
 
 // 将缓存数据写入 74HC595
 void updateShiftRegister() {
-  currentShiftOutput = (motor2Nibble << 4) | (motor1Nibble & 0x0F);
-  digitalWrite(PIN_595_LATCH, LOW); 
+  currentShiftOutput = (motor1Nibble << 4) | (motor2Nibble & 0x0F);
+  digitalWrite(PIN_595_LATCH, LOW);
   shiftOut(PIN_595_DATA, PIN_595_CLOCK, LSBFIRST, currentShiftOutput);
-  digitalWrite(PIN_595_LATCH, HIGH); 
+  digitalWrite(PIN_595_LATCH, HIGH);
 }
 
 // 电机主处理函数 (在 loop 中调用)
