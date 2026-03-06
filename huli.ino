@@ -406,7 +406,7 @@ void processHexCommand(byte cmd[8]) {
   // 1. 风扇控制
   if (memcmp(cmd, cmdFanOn, 8) == 0) {
     fanTriggerEnabled = true;
-    fanDelayMicros = 8000; // 延时8ms，导通2ms，功率约20%
+    fanDelayMicros = 6000; // 延时8ms，导通2ms，功率约20%
     Serial.println("CMD: Fan ON 20% (Wait ZC)");
     sendHex485(cmd); return;
   }
@@ -549,7 +549,7 @@ void processHexCommand(byte cmd[8]) {
   if (memcmp(cmd, cmdAction1, 8) == 0) {
     motor1Running = false; motor2Running = false;
     command1Status = 1;      // 激活 cmdAction1 状态
-    motor1Direction = false; // M1 逆
+    motor1Direction = true; // M1 正
     motor2Direction = true;  // M2 正
     motor1Enabled = true; motor2Enabled = true;
     sendHex485(cmd);
@@ -557,7 +557,7 @@ void processHexCommand(byte cmd[8]) {
   else if (memcmp(cmd, cmdAction2, 8) == 0) {
     motor1Running = false; motor2Running = false;
     command2Status = 1;      // 激活 cmdAction2 状态
-    motor1Direction = false; // M1 逆
+    motor1Direction = true; // M1 正
     motor2Direction = false; // M2 逆
     motor1Enabled = true; motor2Enabled = true;
     sendHex485(cmd);
@@ -682,16 +682,55 @@ void startMotor2() {
 // 电机1 停止逻辑
 void finishRevolutionMotor1() {
   motor1Running = false;
+
+  // Command 1 特殊阶段处理（臀洗模式两阶段）
+  if (command1Status == 1) {
+    command1Status = 2;     // 进入阶段二
+    motor1Direction = false; // 变反转
+    nextTargetSteps1 = 70;   // 70步
+    startMotor1();           // 立即重启
+    Serial.println("CMD1: Phase 2 Start");
+    updateShiftRegister();
+    return; // 退出，保持运行
+  }
+
+  if (command1Status == 2) {
+      Serial.println("CMD1: Done");
+      command1Status = 3; // 标记为完成状态，等待检查
+  }
+
+  // Command 2 特殊阶段处理（妇洗模式两阶段）
+  if (command2Status == 1) {
+    command2Status = 2;     // 进入阶段二
+    motor1Direction = false; // 变反转
+    nextTargetSteps1 = 70;   // 70步
+    startMotor1();           // 立即重启
+    Serial.println("CMD2: Phase 2 Start");
+    updateShiftRegister();
+    return; // 退出，保持运行
+  }
+
+  if (command2Status == 2) {
+      Serial.println("CMD2: Done");
+      command2Status = 3; // 标记为完成状态，等待检查
+  }
+
   motor1Enabled = false;
   stopMotor1();
   updateShiftRegister();
 
-  // 检查是否是 cmdAction1 或 cmdAction2，且两个电机都已停止
-  if ((command1Status == 1 || command2Status == 1) && !motor1Running && !motor2Running) {
+  // 检查是否是 cmdAction1 完成，且两个电机都已停止
+  if (command1Status == 3 && !motor1Running && !motor2Running) {
     digitalWrite(PIN_VALVE3, HIGH); // 打开电磁阀3
-    Serial.println("CMD1/2: Both motors stopped, Valve 3 ON");
+    Serial.println("CMD1: Both motors stopped, Valve 3 ON");
     command1Status = 0; // 重置状态
-    command2Status = 0;
+  }
+
+  // 检查是否是 cmdAction2 完成，且两个电机都已停止
+  if (command2Status == 3 && !motor1Running && !motor2Running) {
+    digitalWrite(PIN_VALVE3, HIGH); // 打开电磁阀3
+    Serial.println("CMD2: Both motors stopped, Valve 3 ON");
+    command2Status = 0; // 重置状态
   }
 }
 
@@ -719,12 +758,18 @@ void finishRevolutionMotor2() {
   stopMotor2();
   updateShiftRegister();
 
-  // 检查是否是 cmdAction1 或 cmdAction2，且两个电机都已停止
-  if ((command1Status == 1 || command2Status == 1) && !motor1Running && !motor2Running) {
+  // 检查是否是 cmdAction1 完成，且两个电机都已停止
+  if (command1Status == 3 && !motor1Running && !motor2Running) {
     digitalWrite(PIN_VALVE3, HIGH); // 打开电磁阀3
-    Serial.println("CMD1/2: Both motors stopped, Valve 3 ON");
+    Serial.println("CMD1: Both motors stopped, Valve 3 ON");
     command1Status = 0; // 重置状态
-    command2Status = 0;
+  }
+
+  // 检查是否是 cmdAction2 完成，且两个电机都已停止
+  if (command2Status == 3 && !motor1Running && !motor2Running) {
+    digitalWrite(PIN_VALVE3, HIGH); // 打开电磁阀3
+    Serial.println("CMD2: Both motors stopped, Valve 3 ON");
+    command2Status = 0; // 重置状态
   }
 
   // 检查是否是 cmdAction3 完成，且两个电机都已停止
