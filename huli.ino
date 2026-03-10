@@ -105,7 +105,11 @@ unsigned long deodorizeStartTime = 0;      // 除臭开始时间
 
 // 烘干功能控制
 bool dryingActive = false;                 // 烘干是否激活
-unsigned long dryingStartTime = 0;         // 烘干开始时间 
+unsigned long dryingStartTime = 0;         // 烘干开始时间
+
+// 冲马桶功能控制
+bool flushActive = false;                  // 冲马桶是否激活
+unsigned long flushStartTime = 0;          // 冲马桶开始时间 
 
 // 电机1 运行时参数
 bool motor1Running = false;
@@ -147,6 +151,7 @@ const byte cmdAction2[8]   = {0xEE, 0x01, 0x00, 0x02, 0x00, 0x00, 0x00, 0x00}; /
 const byte cmdAction3[8]   = {0xEE, 0x01, 0x00, 0x03, 0x00, 0x00, 0x00, 0x00}; // 复合动作、自洁
 const byte cmdDeodorize[8] = {0xEE, 0x01, 0x00, 0x04, 0x00, 0x00, 0x00, 0x00}; // 除臭动作（15秒）
 const byte cmdDrying[8]    = {0xEE, 0x01, 0x00, 0x05, 0x00, 0x00, 0x00, 0x00}; // 烘干动作（15秒）
+const byte cmdFlush[8]     = {0xEE, 0x01, 0x00, 0x06, 0x00, 0x00, 0x00, 0x00}; // 冲马桶（15秒）
 
 // 强电负载指令 (5-12)
 const byte cmdFanOn[8]   = {0xEE, 0x01, 0x00, 0x01, 0x00, 0x01, 0x01, 0x00}; // 风扇开
@@ -353,6 +358,17 @@ void loop() {
       fanDelayMicros = 0;
       dryingActive = false;
       Serial.println("Drying finished (15 seconds elapsed)");
+    }
+  }
+
+  // === 检查冲马桶15秒超时 ===
+  if (flushActive) {
+    if (currentTime - flushStartTime >= 15000) {
+      // 15秒到，关闭电磁阀2和水泵
+      digitalWrite(PIN_VALVE2, LOW);
+      targetStatePump = false;
+      flushActive = false;
+      Serial.println("Flush finished (15 seconds elapsed)");
     }
   }
 
@@ -643,6 +659,15 @@ void processHexCommand(byte cmd[8]) {
     dryingActive = true;
     dryingStartTime = millis();
     Serial.println("CMD: Drying started (15 seconds)");
+    sendHex485(cmd);
+  }
+  else if (memcmp(cmd, cmdFlush, 8) == 0) {
+    // 冲马桶指令：打开电磁阀2+水泵，15秒后自动关闭
+    digitalWrite(PIN_VALVE2, HIGH);
+    targetStatePump = true;
+    flushActive = true;
+    flushStartTime = millis();
+    Serial.println("CMD: Flush started (15 seconds)");
     sendHex485(cmd);
   }
   else if (memcmp(cmd, motor1FwdCmd, 8) == 0) {
