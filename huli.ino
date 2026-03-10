@@ -97,7 +97,11 @@ bool motor1Oscillating = false;           // M1往返运动标志
 int oscillationPhase = 0;                  // 往返相位: 0=前伸20步, 1=后退40步
 unsigned long oscillationStartTime = 0;    // 往返开始时间
 bool oscillationFinishing = false;         // 正在执行结束动作（缩回300步）
-bool retractStarted = false;               // 是否已启动缩回动作 
+bool retractStarted = false;               // 是否已启动缩回动作
+
+// 除臭功能控制
+bool deodorizeActive = false;              // 除臭是否激活
+unsigned long deodorizeStartTime = 0;      // 除臭开始时间 
 
 // 电机1 运行时参数
 bool motor1Running = false;
@@ -134,9 +138,10 @@ const byte motor1FwdCmd[8] = {0xEE, 0x01, 0x00, 0x01, 0x00, 0x01, 0x00, 0x00}; /
 const byte motor1RevCmd[8] = {0xEE, 0x01, 0x00, 0x01, 0x00, 0x02, 0x00, 0x00}; // M1 反转
 const byte motor2FwdCmd[8] = {0xEE, 0x01, 0x00, 0x02, 0x00, 0x01, 0x00, 0x00}; // M2 正转
 const byte motor2RevCmd[8] = {0xEE, 0x01, 0x00, 0x02, 0x00, 0x02, 0x00, 0x00}; // M2 反转
-const byte cmdAction1[8]   = {0xEE, 0x01, 0x00, 0x01, 0x00, 0x00, 0x00, 0x00}; // M1逆 M2正
-const byte cmdAction2[8]   = {0xEE, 0x01, 0x00, 0x02, 0x00, 0x00, 0x00, 0x00}; // 全逆
-const byte cmdAction3[8]   = {0xEE, 0x01, 0x00, 0x03, 0x00, 0x00, 0x00, 0x00}; // 复合动作
+const byte cmdAction1[8]   = {0xEE, 0x01, 0x00, 0x01, 0x00, 0x00, 0x00, 0x00}; // 臀洗
+const byte cmdAction2[8]   = {0xEE, 0x01, 0x00, 0x02, 0x00, 0x00, 0x00, 0x00}; // 全逆、妇洗
+const byte cmdAction3[8]   = {0xEE, 0x01, 0x00, 0x03, 0x00, 0x00, 0x00, 0x00}; // 复合动作、自洁
+const byte cmdDeodorize[8] = {0xEE, 0x01, 0x00, 0x04, 0x00, 0x00, 0x00, 0x00}; // 除臭动作（15秒）
 
 // 强电负载指令 (5-12)
 const byte cmdFanOn[8]   = {0xEE, 0x01, 0x00, 0x01, 0x00, 0x01, 0x01, 0x00}; // 风扇开
@@ -321,6 +326,16 @@ void loop() {
       digitalWrite(PIN_VALVE3, LOW);
 
       // 不在这里启动缩回，等待当前步数完成后在finishRevolutionMotor1()中启动
+    }
+  }
+
+  // === 检查除臭15秒超时 ===
+  if (deodorizeActive) {
+    if (currentTime - deodorizeStartTime >= 15000) {
+      // 15秒到，关闭除臭风扇
+      digitalWrite(PIN_DEODOR_FAN, LOW);
+      deodorizeActive = false;
+      Serial.println("Deodorize finished (15 seconds elapsed)");
     }
   }
 
@@ -593,6 +608,14 @@ void processHexCommand(byte cmd[8]) {
     nextTargetSteps1 = 300;  // 1圈
     nextTargetSteps2 = 300;  // 1圈
     motor1Enabled = true; motor2Enabled = true;
+    sendHex485(cmd);
+  }
+  else if (memcmp(cmd, cmdDeodorize, 8) == 0) {
+    // 除臭指令：打开除臭风扇，15秒后自动关闭
+    digitalWrite(PIN_DEODOR_FAN, HIGH);
+    deodorizeActive = true;
+    deodorizeStartTime = millis();
+    Serial.println("CMD: Deodorize started (15 seconds)");
     sendHex485(cmd);
   }
   else if (memcmp(cmd, motor1FwdCmd, 8) == 0) {
