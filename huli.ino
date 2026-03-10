@@ -109,7 +109,11 @@ unsigned long dryingStartTime = 0;         // 烘干开始时间
 
 // 冲马桶功能控制
 bool flushActive = false;                  // 冲马桶是否激活
-unsigned long flushStartTime = 0;          // 冲马桶开始时间 
+unsigned long flushStartTime = 0;          // 冲马桶开始时间
+
+// 粉碎功能控制
+bool maceratingActive = false;             // 粉碎是否激活
+unsigned long maceratingStartTime = 0;     // 粉碎开始时间 
 
 // 电机1 运行时参数
 bool motor1Running = false;
@@ -152,6 +156,7 @@ const byte cmdAction3[8]   = {0xEE, 0x01, 0x00, 0x03, 0x00, 0x00, 0x00, 0x00}; /
 const byte cmdDeodorize[8] = {0xEE, 0x01, 0x00, 0x04, 0x00, 0x00, 0x00, 0x00}; // 除臭动作（15秒）
 const byte cmdDrying[8]    = {0xEE, 0x01, 0x00, 0x05, 0x00, 0x00, 0x00, 0x00}; // 烘干动作（15秒）
 const byte cmdFlush[8]     = {0xEE, 0x01, 0x00, 0x06, 0x00, 0x00, 0x00, 0x00}; // 冲马桶（15秒）
+const byte cmdMacerating[8]= {0xEE, 0x01, 0x00, 0x07, 0x00, 0x00, 0x00, 0x00}; // 粉碎（10秒）
 
 // 强电负载指令 (5-12)
 const byte cmdFanOn[8]   = {0xEE, 0x01, 0x00, 0x01, 0x00, 0x01, 0x01, 0x00}; // 风扇开
@@ -369,6 +374,16 @@ void loop() {
       targetStatePump = false;
       flushActive = false;
       Serial.println("Flush finished (15 seconds elapsed)");
+    }
+  }
+
+  // === 检查粉碎10秒超时 ===
+  if (maceratingActive) {
+    if (currentTime - maceratingStartTime >= 10000) {
+      // 10秒到，关闭粉碎泵
+      targetStateMacerator = false;
+      maceratingActive = false;
+      Serial.println("Macerating finished (10 seconds elapsed)");
     }
   }
 
@@ -668,6 +683,14 @@ void processHexCommand(byte cmd[8]) {
     flushActive = true;
     flushStartTime = millis();
     Serial.println("CMD: Flush started (15 seconds)");
+    sendHex485(cmd);
+  }
+  else if (memcmp(cmd, cmdMacerating, 8) == 0) {
+    // 粉碎指令：打开粉碎泵，10秒后自动关闭
+    targetStateMacerator = true;
+    maceratingActive = true;
+    maceratingStartTime = millis();
+    Serial.println("CMD: Macerating started (10 seconds)");
     sendHex485(cmd);
   }
   else if (memcmp(cmd, motor1FwdCmd, 8) == 0) {
