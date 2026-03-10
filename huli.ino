@@ -113,7 +113,11 @@ unsigned long flushStartTime = 0;          // 冲马桶开始时间
 
 // 粉碎功能控制
 bool maceratingActive = false;             // 粉碎是否激活
-unsigned long maceratingStartTime = 0;     // 粉碎开始时间 
+unsigned long maceratingStartTime = 0;     // 粉碎开始时间
+
+// 粉碎泵自洁功能控制
+bool maceratorCleanActive = false;         // 粉碎泵自洁是否激活
+unsigned long maceratorCleanStartTime = 0; // 粉碎泵自洁开始时间 
 
 // 电机1 运行时参数
 bool motor1Running = false;
@@ -157,6 +161,7 @@ const byte cmdDeodorize[8] = {0xEE, 0x01, 0x00, 0x04, 0x00, 0x00, 0x00, 0x00}; /
 const byte cmdDrying[8]    = {0xEE, 0x01, 0x00, 0x05, 0x00, 0x00, 0x00, 0x00}; // 烘干动作（15秒）
 const byte cmdFlush[8]     = {0xEE, 0x01, 0x00, 0x06, 0x00, 0x00, 0x00, 0x00}; // 冲马桶（15秒）
 const byte cmdMacerating[8]= {0xEE, 0x01, 0x00, 0x07, 0x00, 0x00, 0x00, 0x00}; // 粉碎（10秒）
+const byte cmdMaceratorClean[8]={0xEE, 0x01, 0x00, 0x08, 0x00, 0x00, 0x00, 0x00}; // 粉碎泵自洁（15秒）
 
 // 强电负载指令 (5-12)
 const byte cmdFanOn[8]   = {0xEE, 0x01, 0x00, 0x01, 0x00, 0x01, 0x01, 0x00}; // 风扇开
@@ -384,6 +389,18 @@ void loop() {
       targetStateMacerator = false;
       maceratingActive = false;
       Serial.println("Macerating finished (10 seconds elapsed)");
+    }
+  }
+
+  // === 检查粉碎泵自洁15秒超时 ===
+  if (maceratorCleanActive) {
+    if (currentTime - maceratorCleanStartTime >= 15000) {
+      // 15秒到，关闭电磁阀1、水泵、粉碎泵
+      digitalWrite(PIN_VALVE1, LOW);
+      targetStatePump = false;
+      targetStateMacerator = false;
+      maceratorCleanActive = false;
+      Serial.println("Macerator clean finished (15 seconds elapsed)");
     }
   }
 
@@ -691,6 +708,16 @@ void processHexCommand(byte cmd[8]) {
     maceratingActive = true;
     maceratingStartTime = millis();
     Serial.println("CMD: Macerating started (10 seconds)");
+    sendHex485(cmd);
+  }
+  else if (memcmp(cmd, cmdMaceratorClean, 8) == 0) {
+    // 粉碎泵自洁指令：打开电磁阀1+水泵+粉碎泵，15秒后自动关闭
+    digitalWrite(PIN_VALVE1, HIGH);
+    targetStatePump = true;
+    targetStateMacerator = true;
+    maceratorCleanActive = true;
+    maceratorCleanStartTime = millis();
+    Serial.println("CMD: Macerator clean started (15 seconds)");
     sendHex485(cmd);
   }
   else if (memcmp(cmd, motor1FwdCmd, 8) == 0) {
