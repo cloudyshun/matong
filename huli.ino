@@ -335,7 +335,7 @@ void loop() {
 
   // === 检查往返运动10秒超时 ===
   if (motor1Oscillating && !oscillationFinishing) {
-    if (currentTime - oscillationStartTime >= 10000) {
+    if (millis() - oscillationStartTime >= 10000) {
       // 10秒到，停止往返，执行结束流程
       Serial.println("Oscillation timeout, starting finish sequence");
       oscillationFinishing = true;
@@ -351,7 +351,7 @@ void loop() {
 
   // === 检查除臭15秒超时 ===
   if (deodorizeActive) {
-    if (currentTime - deodorizeStartTime >= 15000) {
+    if (millis() - deodorizeStartTime >= 15000) {
       // 15秒到，关闭除臭风扇
       digitalWrite(PIN_DEODOR_FAN, LOW);
       deodorizeActive = false;
@@ -361,7 +361,7 @@ void loop() {
 
   // === 检查烘干15秒超时 ===
   if (dryingActive) {
-    if (currentTime - dryingStartTime >= 15000) {
+    if (millis() - dryingStartTime >= 15000) {
       // 15秒到，关闭烘干风扇和风扇电热丝
       digitalWrite(PIN_DRY_FAN, LOW);
       fanTriggerEnabled = false;
@@ -373,7 +373,7 @@ void loop() {
 
   // === 检查冲马桶15秒超时 ===
   if (flushActive) {
-    if (currentTime - flushStartTime >= 15000) {
+    if (millis() - flushStartTime >= 15000) {
       // 15秒到，关闭电磁阀2和水泵
       digitalWrite(PIN_VALVE2, LOW);
       targetStatePump = false;
@@ -384,7 +384,7 @@ void loop() {
 
   // === 检查粉碎10秒超时 ===
   if (maceratingActive) {
-    if (currentTime - maceratingStartTime >= 10000) {
+    if (millis() - maceratingStartTime >= 10000) {
       // 10秒到，关闭粉碎泵
       targetStateMacerator = false;
       maceratingActive = false;
@@ -394,7 +394,7 @@ void loop() {
 
   // === 检查粉碎泵自洁15秒超时 ===
   if (maceratorCleanActive) {
-    if (currentTime - maceratorCleanStartTime >= 15000) {
+    if (millis() - maceratorCleanStartTime >= 15000) {
       // 15秒到，关闭电磁阀1、水泵、粉碎泵
       digitalWrite(PIN_VALVE1, LOW);
       targetStatePump = false;
@@ -404,7 +404,7 @@ void loop() {
     }
   }
 
-  // 温度读取 (每2秒)
+  // 温度读取 (每2秒) - 这里仍使用 currentTime，因为不需要实时性
   if(currentTime - lastTempTime >= 2000) {
     currentTemperature = readTemperature();
     lastTempTime = currentTime;
@@ -413,7 +413,7 @@ void loop() {
     Serial.println(" C");
   }
 
-  // 温度数据上传 (每5秒)
+  // 温度数据上传 (每5秒) - 这里仍使用 currentTime，因为不需要实时性
   if(currentTime - lastUploadTime >= 5000) {
     uploadTemperatureData();
     lastUploadTime = currentTime;
@@ -498,11 +498,68 @@ void sendHex485(byte data[8]) {
 
 void processHexCommand(byte cmd[8]) {
   if (cmd[0] != 0xEE) return;
-  
+
   // 重置电机默认目标
-  nextTargetSteps1 = STEPS_PER_REVOLUTION; 
-  nextTargetSteps2 = STEPS_PER_REVOLUTION; 
+  nextTargetSteps1 = STEPS_PER_REVOLUTION;
+  nextTargetSteps2 = STEPS_PER_REVOLUTION;
   // 注意：command3Status 在收到新指令时需要根据情况重置，但在电机未跑完时不建议打断
+
+  // === 复合指令（优先判断） ===
+
+  // 1. 除臭复合指令
+  if (memcmp(cmd, cmdDeodorize, 8) == 0) {
+    deodorizeActive = true;
+    deodorizeStartTime = millis();
+    Serial.println("CMD: Deodorize started (15 seconds)");
+    sendHex485(cmd);
+    digitalWrite(PIN_DEODOR_FAN, HIGH);
+    return;
+  }
+
+  // 2. 烘干复合指令
+  if (memcmp(cmd, cmdDrying, 8) == 0) {
+    fanTriggerEnabled = true;
+    fanDelayMicros = 6000;  // 20%功率
+    dryingActive = true;
+    dryingStartTime = millis();
+    Serial.println("CMD: Drying started (15 seconds)");
+    sendHex485(cmd);
+    digitalWrite(PIN_DRY_FAN, HIGH);
+    return;
+  }
+
+  // 3. 冲马桶复合指令
+  if (memcmp(cmd, cmdFlush, 8) == 0) {
+    digitalWrite(PIN_VALVE2, HIGH);
+    targetStatePump = true;
+    flushActive = true;
+    flushStartTime = millis();
+    Serial.println("CMD: Flush started (15 seconds)");
+    sendHex485(cmd);
+    return;
+  }
+
+  // 4. 粉碎复合指令
+  if (memcmp(cmd, cmdMacerating, 8) == 0) {
+    targetStateMacerator = true;
+    maceratingActive = true;
+    maceratingStartTime = millis();
+    Serial.println("CMD: Macerating started (10 seconds)");
+    sendHex485(cmd);
+    return;
+  }
+
+  // 5. 粉碎泵自洁复合指令
+  if (memcmp(cmd, cmdMaceratorClean, 8) == 0) {
+    digitalWrite(PIN_VALVE1, HIGH);
+    targetStatePump = true;
+    targetStateMacerator = true;
+    maceratorCleanActive = true;
+    maceratorCleanStartTime = millis();
+    Serial.println("CMD: Macerator clean started (15 seconds)");
+    sendHex485(cmd);
+    return;
+  }
 
   // --- A. 强电控制指令 (只修改变量，不操作IO) ---
   
@@ -639,58 +696,6 @@ void processHexCommand(byte cmd[8]) {
   else if (memcmp(cmd, cmdValve3Off, 8) == 0) {
     digitalWrite(PIN_VALVE3, LOW);
     Serial.println("CMD: Valve 3 OFF");
-    sendHex485(cmd); return;
-  }
-
-  // 10. 除臭复合指令
-  else if (memcmp(cmd, cmdDeodorize, 8) == 0) {
-    deodorizeActive = true;
-    deodorizeStartTime = millis();
-    Serial.println("CMD: Deodorize started (15 seconds)");
-    sendHex485(cmd);
-    digitalWrite(PIN_DEODOR_FAN, HIGH);
-    return;
-  }
-
-  // 11. 烘干复合指令
-  else if (memcmp(cmd, cmdDrying, 8) == 0) {
-    fanTriggerEnabled = true;
-    fanDelayMicros = 6000;  // 20%功率
-    dryingActive = true;
-    dryingStartTime = millis();
-    Serial.println("CMD: Drying started (15 seconds)");
-    sendHex485(cmd);
-    digitalWrite(PIN_DRY_FAN, HIGH);
-    return;
-  }
-
-  // 12. 冲马桶复合指令
-  else if (memcmp(cmd, cmdFlush, 8) == 0) {
-    digitalWrite(PIN_VALVE2, HIGH);
-    targetStatePump = true;
-    flushActive = true;
-    flushStartTime = millis();
-    Serial.println("CMD: Flush started (15 seconds)");
-    sendHex485(cmd); return;
-  }
-
-  // 13. 粉碎复合指令
-  else if (memcmp(cmd, cmdMacerating, 8) == 0) {
-    targetStateMacerator = true;
-    maceratingActive = true;
-    maceratingStartTime = millis();
-    Serial.println("CMD: Macerating started (10 seconds)");
-    sendHex485(cmd); return;
-  }
-
-  // 14. 粉碎泵自洁复合指令
-  else if (memcmp(cmd, cmdMaceratorClean, 8) == 0) {
-    digitalWrite(PIN_VALVE1, HIGH);
-    targetStatePump = true;
-    targetStateMacerator = true;
-    maceratorCleanActive = true;
-    maceratorCleanStartTime = millis();
-    Serial.println("CMD: Macerator clean started (15 seconds)");
     sendHex485(cmd); return;
   }
 
