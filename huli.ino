@@ -100,12 +100,12 @@ bool oscillationFinishing = false;         // 正在执行结束动作（缩回3
 bool retractStarted = false;               // 是否已启动缩回动作
 
 // 除臭功能控制
-bool deodorizeActive = false;              // 除臭是否激活
-unsigned long deodorizeStartTime = 0;      // 除臭开始时间
+volatile bool deodorizeActive = false;              // 除臭是否激活
+volatile unsigned long deodorizeStartTime = 0;      // 除臭开始时间
 
 // 烘干功能控制
-bool dryingActive = false;                 // 烘干是否激活
-unsigned long dryingStartTime = 0;         // 烘干开始时间
+volatile bool dryingActive = false;                 // 烘干是否激活
+volatile unsigned long dryingStartTime = 0;         // 烘干开始时间
 
 // 冲马桶功能控制
 bool flushActive = false;                  // 冲马桶是否激活
@@ -642,13 +642,65 @@ void processHexCommand(byte cmd[8]) {
     sendHex485(cmd); return;
   }
 
+  // 10. 除臭复合指令
+  else if (memcmp(cmd, cmdDeodorize, 8) == 0) {
+    deodorizeActive = true;
+    deodorizeStartTime = millis();
+    Serial.println("CMD: Deodorize started (15 seconds)");
+    sendHex485(cmd);
+    digitalWrite(PIN_DEODOR_FAN, HIGH);
+    return;
+  }
+
+  // 11. 烘干复合指令
+  else if (memcmp(cmd, cmdDrying, 8) == 0) {
+    fanTriggerEnabled = true;
+    fanDelayMicros = 6000;  // 20%功率
+    dryingActive = true;
+    dryingStartTime = millis();
+    Serial.println("CMD: Drying started (15 seconds)");
+    sendHex485(cmd);
+    digitalWrite(PIN_DRY_FAN, HIGH);
+    return;
+  }
+
+  // 12. 冲马桶复合指令
+  else if (memcmp(cmd, cmdFlush, 8) == 0) {
+    digitalWrite(PIN_VALVE2, HIGH);
+    targetStatePump = true;
+    flushActive = true;
+    flushStartTime = millis();
+    Serial.println("CMD: Flush started (15 seconds)");
+    sendHex485(cmd); return;
+  }
+
+  // 13. 粉碎复合指令
+  else if (memcmp(cmd, cmdMacerating, 8) == 0) {
+    targetStateMacerator = true;
+    maceratingActive = true;
+    maceratingStartTime = millis();
+    Serial.println("CMD: Macerating started (10 seconds)");
+    sendHex485(cmd); return;
+  }
+
+  // 14. 粉碎泵自洁复合指令
+  else if (memcmp(cmd, cmdMaceratorClean, 8) == 0) {
+    digitalWrite(PIN_VALVE1, HIGH);
+    targetStatePump = true;
+    targetStateMacerator = true;
+    maceratorCleanActive = true;
+    maceratorCleanStartTime = millis();
+    Serial.println("CMD: Macerator clean started (15 seconds)");
+    sendHex485(cmd); return;
+  }
+
   // --- B. 步进电机控制指令 ---
 
   // 收到新电机指令，先重置电机状态机
   command1Status = 0;
   command2Status = 0;
-  command3Status = 0; 
-  
+  command3Status = 0;
+
   if (memcmp(cmd, cmdAction1, 8) == 0) {
     motor1Running = false; motor2Running = false;
     command1Status = 1;      // 激活 cmdAction1 状态
@@ -675,54 +727,9 @@ void processHexCommand(byte cmd[8]) {
     motor1Enabled = true; motor2Enabled = true;
     sendHex485(cmd);
   }
-  else if (memcmp(cmd, cmdDeodorize, 8) == 0) {
-    // 除臭指令：打开除臭风扇，15秒后自动关闭
-    digitalWrite(PIN_DEODOR_FAN, HIGH);
-    deodorizeActive = true;
-    deodorizeStartTime = millis();
-    Serial.println("CMD: Deodorize started (15 seconds)");
-    sendHex485(cmd);
-  }
-  else if (memcmp(cmd, cmdDrying, 8) == 0) {
-    // 烘干指令：打开烘干风扇+风扇电热丝，15秒后自动关闭
-    digitalWrite(PIN_DRY_FAN, HIGH);
-    fanTriggerEnabled = true;
-    fanDelayMicros = 6000;  // 20%功率
-    dryingActive = true;
-    dryingStartTime = millis();
-    Serial.println("CMD: Drying started (15 seconds)");
-    sendHex485(cmd);
-  }
-  else if (memcmp(cmd, cmdFlush, 8) == 0) {
-    // 冲马桶指令：打开电磁阀2+水泵，15秒后自动关闭
-    digitalWrite(PIN_VALVE2, HIGH);
-    targetStatePump = true;
-    flushActive = true;
-    flushStartTime = millis();
-    Serial.println("CMD: Flush started (15 seconds)");
-    sendHex485(cmd);
-  }
-  else if (memcmp(cmd, cmdMacerating, 8) == 0) {
-    // 粉碎指令：打开粉碎泵，10秒后自动关闭
-    targetStateMacerator = true;
-    maceratingActive = true;
-    maceratingStartTime = millis();
-    Serial.println("CMD: Macerating started (10 seconds)");
-    sendHex485(cmd);
-  }
-  else if (memcmp(cmd, cmdMaceratorClean, 8) == 0) {
-    // 粉碎泵自洁指令：打开电磁阀1+水泵+粉碎泵，15秒后自动关闭
-    digitalWrite(PIN_VALVE1, HIGH);
-    targetStatePump = true;
-    targetStateMacerator = true;
-    maceratorCleanActive = true;
-    maceratorCleanStartTime = millis();
-    Serial.println("CMD: Macerator clean started (15 seconds)");
-    sendHex485(cmd);
-  }
   else if (memcmp(cmd, motor1FwdCmd, 8) == 0) {
-    motor1Running = false; 
-    motor1Direction = true; 
+    motor1Running = false;
+    motor1Direction = true;
     motor1Enabled = true;
     sendHex485(cmd);
   }
