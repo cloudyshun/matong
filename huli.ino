@@ -96,7 +96,8 @@ int command3Status = 0;
 bool motor1Oscillating = false;           // M1往返运动标志
 int oscillationPhase = 0;                  // 往返相位: 0=前伸20步, 1=后退40步
 unsigned long oscillationStartTime = 0;    // 往返开始时间
-bool oscillationFinishing = false;         // 正在执行结束动作（缩回300步） 
+bool oscillationFinishing = false;         // 正在执行结束动作（缩回300步）
+bool retractStarted = false;               // 是否已启动缩回动作 
 
 // 电机1 运行时参数
 bool motor1Running = false;
@@ -313,24 +314,13 @@ void loop() {
       // 10秒到，停止往返，执行结束流程
       Serial.println("Oscillation timeout, starting finish sequence");
       oscillationFinishing = true;
+      retractStarted = false;  // 重置缩回标志
 
       // 关闭水泵和电磁阀3
       targetStatePump = false;
       digitalWrite(PIN_VALVE3, LOW);
 
-      // 等待当前步数完成，然后缩回300步
-      // 由于motor1可能正在运行，需要等它停下来
-      // 这里设置标志，在finishRevolutionMotor1()中检测到oscillationFinishing后会执行缩回
-      motor1Enabled = true;  // 确保电机可以继续运行
-
-      // 如果电机当前不在运行，立即启动缩回
-      if (!motor1Running) {
-        nextTargetSteps1 = 300;
-        motor1Direction = true;  // 正转缩回
-        startMotor1();
-        Serial.println("Motor1 retracting 300 steps");
-      }
-      // 如果电机正在运行，会在当前步数完成后自动检测oscillationFinishing并缩回
+      // 不在这里启动缩回，等待当前步数完成后在finishRevolutionMotor1()中启动
     }
   }
 
@@ -719,7 +709,7 @@ void finishRevolutionMotor1() {
   // === 往返运动循环逻辑 ===
   if (motor1Oscillating && !oscillationFinishing) {
     if (oscillationPhase == 0) {
-      // 刚完成前伸20步，开始后退40步
+      // 刚完成前伸20步，开始后退40步（经过中心，到最后位置）
       oscillationPhase = 1;
       nextTargetSteps1 = 40;
       motor1Direction = false;  // 反转
@@ -728,9 +718,9 @@ void finishRevolutionMotor1() {
       return;
     }
     else if (oscillationPhase == 1) {
-      // 刚完成后退40步，回到中心20步
+      // 刚完成后退40步（到达最后位置），再前伸40步回到最前
       oscillationPhase = 0;
-      nextTargetSteps1 = 20;
+      nextTargetSteps1 = 40;
       motor1Direction = true;   // 正转
       startMotor1();
       updateShiftRegister();
@@ -739,15 +729,31 @@ void finishRevolutionMotor1() {
   }
 
   // === 往返运动结束后的缩回动作 ===
-  if (oscillationFinishing && !motor1Running) {
-    // 刚完成缩回300步（或者等待启动缩回），复位所有状态
-    motor1Oscillating = false;
-    oscillationFinishing = false;
-    motor1Enabled = false;
-    stopMotor1();
-    updateShiftRegister();
-    Serial.println("Oscillation finished, motor1 retracted");
-    return;
+  if (oscillationFinishing) {
+    if (!retractStarted) {
+      // 还未启动缩回，启动缩回300步
+      retractStarted = true;
+      nextTargetSteps1 = 300;
+      motor1Direction = true;  // 正转缩回
+      motor1Enabled = true;
+      startMotor1();
+      Serial.println("Motor1 retracting 300 steps");
+      updateShiftRegister();
+      return;
+    } else if (!motor1Running) {
+      // 已启动缩回且电机已停止，说明缩回完成，复位所有状态
+      motor1Oscillating = false;
+      oscillationFinishing = false;
+      retractStarted = false;
+      motor1Enabled = false;
+      stopMotor1();
+      updateShiftRegister();
+      Serial.println("Oscillation finished, motor1 retracted");
+      return;
+    } else {
+      // 缩回正在进行中，等待完成
+      return;
+    }
   }
 
   // Command 1 特殊阶段处理（臀洗模式两阶段）
