@@ -90,7 +90,13 @@ int nextTargetSteps2 = STEPS_PER_REVOLUTION;
 // 复合动作指令的状态机
 int command1Status = 0; // cmdAction1 状态标志
 int command2Status = 0; // cmdAction2 状态标志
-int command3Status = 0; 
+int command3Status = 0;
+
+// 电机1往返运动控制
+bool motor1Oscillating = false;           // M1往返运动标志
+int oscillationPhase = 0;                  // 往返相位: 0=前伸20步, 1=后退40步
+unsigned long oscillationStartTime = 0;    // 往返开始时间
+bool oscillationFinishing = false;         // 正在执行结束动作（缩回300步） 
 
 // 电机1 运行时参数
 bool motor1Running = false;
@@ -300,6 +306,33 @@ void loop() {
 
   // 检查 RS485 指令
   handleRS485Commands();
+
+  // === 检查往返运动10秒超时 ===
+  if (motor1Oscillating && !oscillationFinishing) {
+    if (currentTime - oscillationStartTime >= 10000) {
+      // 10秒到，停止往返，执行结束流程
+      Serial.println("Oscillation timeout, starting finish sequence");
+      oscillationFinishing = true;
+
+      // 关闭水泵和电磁阀3
+      targetStatePump = false;
+      digitalWrite(PIN_VALVE3, LOW);
+
+      // 等待当前步数完成，然后缩回300步
+      // 由于motor1可能正在运行，需要等它停下来
+      // 这里设置标志，在finishRevolutionMotor1()中检测到oscillationFinishing后会执行缩回
+      motor1Enabled = true;  // 确保电机可以继续运行
+
+      // 如果电机当前不在运行，立即启动缩回
+      if (!motor1Running) {
+        nextTargetSteps1 = 300;
+        motor1Direction = true;  // 正转缩回
+        startMotor1();
+        Serial.println("Motor1 retracting 300 steps");
+      }
+      // 如果电机正在运行，会在当前步数完成后自动检测oscillationFinishing并缩回
+    }
+  }
 
   // 温度读取 (每2秒)
   if(currentTime - lastTempTime >= 2000) {
@@ -683,6 +716,40 @@ void startMotor2() {
 void finishRevolutionMotor1() {
   motor1Running = false;
 
+  // === 往返运动循环逻辑 ===
+  if (motor1Oscillating && !oscillationFinishing) {
+    if (oscillationPhase == 0) {
+      // 刚完成前伸20步，开始后退40步
+      oscillationPhase = 1;
+      nextTargetSteps1 = 40;
+      motor1Direction = false;  // 反转
+      startMotor1();
+      updateShiftRegister();
+      return;
+    }
+    else if (oscillationPhase == 1) {
+      // 刚完成后退40步，回到中心20步
+      oscillationPhase = 0;
+      nextTargetSteps1 = 20;
+      motor1Direction = true;   // 正转
+      startMotor1();
+      updateShiftRegister();
+      return;
+    }
+  }
+
+  // === 往返运动结束后的缩回动作 ===
+  if (oscillationFinishing && !motor1Running) {
+    // 刚完成缩回300步（或者等待启动缩回），复位所有状态
+    motor1Oscillating = false;
+    oscillationFinishing = false;
+    motor1Enabled = false;
+    stopMotor1();
+    updateShiftRegister();
+    Serial.println("Oscillation finished, motor1 retracted");
+    return;
+  }
+
   // Command 1 特殊阶段处理（臀洗模式两阶段）
   if (command1Status == 1) {
     command1Status = 2;     // 进入阶段二
@@ -695,7 +762,7 @@ void finishRevolutionMotor1() {
   }
 
   if (command1Status == 2) {
-      Serial.println("CMD1: Done");
+      Serial.println("CMD1: Phase 2 Done");
       command1Status = 3; // 标记为完成状态，等待检查
   }
 
@@ -711,7 +778,7 @@ void finishRevolutionMotor1() {
   }
 
   if (command2Status == 2) {
-      Serial.println("CMD2: Done");
+      Serial.println("CMD2: Phase 2 Done");
       command2Status = 3; // 标记为完成状态，等待检查
   }
 
@@ -722,15 +789,37 @@ void finishRevolutionMotor1() {
   // 检查是否是 cmdAction1 完成，且两个电机都已停止
   if (command1Status == 3 && !motor1Running && !motor2Running) {
     digitalWrite(PIN_VALVE3, HIGH); // 打开电磁阀3
-    Serial.println("CMD1: Both motors stopped, Valve 3 ON");
+    targetStatePump = true; // 打开水泵
+    // 启动往返运动
+    motor1Oscillating = true;
+    oscillationPhase = 0;
+    oscillationStartTime = millis();
+    oscillationFinishing = false;
+    motor1Enabled = true;
+    nextTargetSteps1 = 20;  // 第一次前伸20步
+    motor1Direction = true;
+    startMotor1();
+    Serial.println("CMD1: Start oscillation (wash cycle)");
     command1Status = 0; // 重置状态
+    return;
   }
 
   // 检查是否是 cmdAction2 完成，且两个电机都已停止
   if (command2Status == 3 && !motor1Running && !motor2Running) {
     digitalWrite(PIN_VALVE3, HIGH); // 打开电磁阀3
-    Serial.println("CMD2: Both motors stopped, Valve 3 ON");
+    targetStatePump = true; // 打开水泵
+    // 启动往返运动
+    motor1Oscillating = true;
+    oscillationPhase = 0;
+    oscillationStartTime = millis();
+    oscillationFinishing = false;
+    motor1Enabled = true;
+    nextTargetSteps1 = 20;  // 第一次前伸20步
+    motor1Direction = true;
+    startMotor1();
+    Serial.println("CMD2: Start oscillation (wash cycle)");
     command2Status = 0; // 重置状态
+    return;
   }
 }
 
@@ -761,21 +850,24 @@ void finishRevolutionMotor2() {
   // 检查是否是 cmdAction1 完成，且两个电机都已停止
   if (command1Status == 3 && !motor1Running && !motor2Running) {
     digitalWrite(PIN_VALVE3, HIGH); // 打开电磁阀3
-    Serial.println("CMD1: Both motors stopped, Valve 3 ON");
+    targetStatePump = true; // 打开水泵
+    Serial.println("CMD1: Both motors stopped, Valve 3 ON, Pump ON");
     command1Status = 0; // 重置状态
   }
 
   // 检查是否是 cmdAction2 完成，且两个电机都已停止
   if (command2Status == 3 && !motor1Running && !motor2Running) {
     digitalWrite(PIN_VALVE3, HIGH); // 打开电磁阀3
-    Serial.println("CMD2: Both motors stopped, Valve 3 ON");
+    targetStatePump = true; // 打开水泵
+    Serial.println("CMD2: Both motors stopped, Valve 3 ON, Pump ON");
     command2Status = 0; // 重置状态
   }
 
   // 检查是否是 cmdAction3 完成，且两个电机都已停止
   if (command3Status == 3 && !motor1Running && !motor2Running) {
     digitalWrite(PIN_VALVE3, HIGH); // 打开电磁阀3
-    Serial.println("CMD3: Both motors stopped, Valve 3 ON");
+    targetStatePump = true; // 打开水泵
+    Serial.println("CMD3: Both motors stopped, Valve 3 ON, Pump ON");
     command3Status = 0; // 重置状态
   }
 }
