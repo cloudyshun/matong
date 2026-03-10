@@ -101,7 +101,11 @@ bool retractStarted = false;               // 是否已启动缩回动作
 
 // 除臭功能控制
 bool deodorizeActive = false;              // 除臭是否激活
-unsigned long deodorizeStartTime = 0;      // 除臭开始时间 
+unsigned long deodorizeStartTime = 0;      // 除臭开始时间
+
+// 烘干功能控制
+bool dryingActive = false;                 // 烘干是否激活
+unsigned long dryingStartTime = 0;         // 烘干开始时间 
 
 // 电机1 运行时参数
 bool motor1Running = false;
@@ -142,6 +146,7 @@ const byte cmdAction1[8]   = {0xEE, 0x01, 0x00, 0x01, 0x00, 0x00, 0x00, 0x00}; /
 const byte cmdAction2[8]   = {0xEE, 0x01, 0x00, 0x02, 0x00, 0x00, 0x00, 0x00}; // 全逆、妇洗
 const byte cmdAction3[8]   = {0xEE, 0x01, 0x00, 0x03, 0x00, 0x00, 0x00, 0x00}; // 复合动作、自洁
 const byte cmdDeodorize[8] = {0xEE, 0x01, 0x00, 0x04, 0x00, 0x00, 0x00, 0x00}; // 除臭动作（15秒）
+const byte cmdDrying[8]    = {0xEE, 0x01, 0x00, 0x05, 0x00, 0x00, 0x00, 0x00}; // 烘干动作（15秒）
 
 // 强电负载指令 (5-12)
 const byte cmdFanOn[8]   = {0xEE, 0x01, 0x00, 0x01, 0x00, 0x01, 0x01, 0x00}; // 风扇开
@@ -150,8 +155,8 @@ const byte cmdPumpOn[8]  = {0xEE, 0x01, 0x00, 0x01, 0x00, 0x01, 0x02, 0x00}; // 
 const byte cmdPumpOff[8] = {0xEE, 0x01, 0x00, 0x01, 0x00, 0x01, 0x02, 0x01}; // 水泵关
 const byte cmdMacOn[8]   = {0xEE, 0x01, 0x00, 0x01, 0x00, 0x01, 0x04, 0x00}; // 粉碎开
 const byte cmdMacOff[8]  = {0xEE, 0x01, 0x00, 0x01, 0x00, 0x01, 0x04, 0x01}; // 粉碎关
-const byte cmdDryFanOn[8]  = {0xEE, 0x01, 0x00, 0x01, 0x00, 0x01, 0x05, 0x00}; // 烘干风扇开
-const byte cmdDryFanOff[8] = {0xEE, 0x01, 0x00, 0x01, 0x00, 0x01, 0x05, 0x01}; // 烘干风扇关
+const byte cmdDryFanOn[8]  = {0xEE, 0x01, 0x00, 0x01, 0x00, 0x01, 0x05, 0x00}; // 烘干电热丝开
+const byte cmdDryFanOff[8] = {0xEE, 0x01, 0x00, 0x01, 0x00, 0x01, 0x05, 0x01}; // 烘干电热丝关
 const byte cmdDeodorFanOn[8]  = {0xEE, 0x01, 0x00, 0x01, 0x00, 0x01, 0x06, 0x00}; // 除臭风扇开
 const byte cmdDeodorFanOff[8] = {0xEE, 0x01, 0x00, 0x01, 0x00, 0x01, 0x06, 0x01}; // 除臭风扇关
 const byte cmdValve1On[8]  = {0xEE, 0x01, 0x00, 0x01, 0x00, 0x01, 0x07, 0x00}; // 电磁阀1开
@@ -336,6 +341,18 @@ void loop() {
       digitalWrite(PIN_DEODOR_FAN, LOW);
       deodorizeActive = false;
       Serial.println("Deodorize finished (15 seconds elapsed)");
+    }
+  }
+
+  // === 检查烘干15秒超时 ===
+  if (dryingActive) {
+    if (currentTime - dryingStartTime >= 15000) {
+      // 15秒到，关闭烘干风扇和风扇电热丝
+      digitalWrite(PIN_DRY_FAN, LOW);
+      fanTriggerEnabled = false;
+      fanDelayMicros = 0;
+      dryingActive = false;
+      Serial.println("Drying finished (15 seconds elapsed)");
     }
   }
 
@@ -616,6 +633,16 @@ void processHexCommand(byte cmd[8]) {
     deodorizeActive = true;
     deodorizeStartTime = millis();
     Serial.println("CMD: Deodorize started (15 seconds)");
+    sendHex485(cmd);
+  }
+  else if (memcmp(cmd, cmdDrying, 8) == 0) {
+    // 烘干指令：打开烘干风扇+风扇电热丝，15秒后自动关闭
+    digitalWrite(PIN_DRY_FAN, HIGH);
+    fanTriggerEnabled = true;
+    fanDelayMicros = 6000;  // 20%功率
+    dryingActive = true;
+    dryingStartTime = millis();
+    Serial.println("CMD: Drying started (15 seconds)");
     sendHex485(cmd);
   }
   else if (memcmp(cmd, motor1FwdCmd, 8) == 0) {
