@@ -110,6 +110,7 @@ volatile unsigned long dryingStartTime = 0;         // 烘干开始时间
 // 冲马桶功能控制
 bool flushActive = false;                  // 冲马桶是否激活
 unsigned long flushStartTime = 0;          // 冲马桶开始时间
+int flushStatus = 0;                       // 冲马桶阶段状态：0=未激活，1=阶段1（冲水），2=阶段2（粉碎）
 
 // 粉碎功能控制
 bool maceratingActive = false;             // 粉碎是否激活
@@ -371,14 +372,30 @@ void loop() {
     }
   }
 
-  // === 检查冲马桶15秒超时 ===
+  // === 检查冲马桶阶段超时 ===
   if (flushActive) {
-    if (millis() - flushStartTime >= 15000) {
-      // 15秒到，关闭电磁阀2和水泵
-      digitalWrite(PIN_VALVE2, LOW);
-      targetStatePump = false;
-      flushActive = false;
-      Serial.println("Flush finished (15 seconds elapsed)");
+    if (flushStatus == 1) {
+      // 阶段1：冲水15秒
+      if (millis() - flushStartTime >= 15000) {
+        // 阶段1完成，关闭电磁阀2和水泵
+        digitalWrite(PIN_VALVE2, LOW);
+        targetStatePump = false;
+        // 进入阶段2：启动粉碎泵
+        flushStatus = 2;
+        flushStartTime = millis();  // 重置计时器
+        targetStateMacerator = true;
+        Serial.println("Flush Stage 1 finished, Stage 2 started (macerating 15 seconds)");
+      }
+    }
+    else if (flushStatus == 2) {
+      // 阶段2：粉碎15秒
+      if (millis() - flushStartTime >= 15000) {
+        // 阶段2完成，关闭粉碎泵
+        targetStateMacerator = false;
+        flushActive = false;
+        flushStatus = 0;
+        Serial.println("Flush finished (both stages completed)");
+      }
     }
   }
 
@@ -533,8 +550,9 @@ void processHexCommand(byte cmd[8]) {
     digitalWrite(PIN_VALVE2, HIGH);
     targetStatePump = true;
     flushActive = true;
+    flushStatus = 1;  // 进入阶段1（冲水）
     flushStartTime = millis();
-    Serial.println("CMD: Flush started (15 seconds)");
+    Serial.println("CMD: Flush started - Stage 1 (15 seconds)");
     sendHex485(cmd);
     return;
   }
