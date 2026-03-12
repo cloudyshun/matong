@@ -118,7 +118,13 @@ unsigned long maceratingStartTime = 0;     // 粉碎开始时间
 
 // 粉碎泵自洁功能控制
 bool maceratorCleanActive = false;         // 粉碎泵自洁是否激活
-unsigned long maceratorCleanStartTime = 0; // 粉碎泵自洁开始时间 
+unsigned long maceratorCleanStartTime = 0; // 粉碎泵自洁开始时间
+
+// 加热器延时控制（防干烧）
+bool heaterPendingStart = false;           // 加热器等待启动标志
+unsigned long heaterStartDelayTime = 0;    // 加热器启动延时计时器
+bool heaterPendingStop = false;            // 加热器等待关闭标志
+unsigned long heaterStopDelayTime = 0;     // 加热器关闭延时计时器 
 
 // 电机1 运行时参数
 bool motor1Running = false;
@@ -342,9 +348,15 @@ void loop() {
       oscillationFinishing = true;
       retractStarted = false;  // 重置缩回标志
 
-      // 关闭水泵和电磁阀3
-      targetStatePump = false;
+      // 关闭加热器和电磁阀3
+      heaterTriggerEnabled = false;
+      heaterDelayMicros = 0;
       digitalWrite(PIN_VALVE3, LOW);
+
+      // 启动水泵关闭延时：先关加热器，0.5秒后再关水泵
+      heaterPendingStop = true;
+      heaterStopDelayTime = millis();
+      Serial.println("Heater OFF, pump will stop in 0.5s");
 
       // 不在这里启动缩回，等待当前步数完成后在finishRevolutionMotor1()中启动
     }
@@ -421,6 +433,27 @@ void loop() {
     }
   }
 
+  // === 检查加热器启动延时（防干烧：先开水泵，1秒后再开加热器） ===
+  if (heaterPendingStart) {
+    if (millis() - heaterStartDelayTime >= 1000) {
+      // 1秒延时到，启动加热器40%功率
+      heaterTriggerEnabled = true;
+      heaterDelayMicros = 6000;  // 40%功率
+      heaterPendingStart = false;
+      Serial.println("Heater started (40% power) after 1s delay");
+    }
+  }
+
+  // === 检查加热器关闭延时（防干烧：先关加热器，0.5秒后再关水泵） ===
+  if (heaterPendingStop) {
+    if (millis() - heaterStopDelayTime >= 500) {
+      // 0.5秒延时到，关闭水泵
+      targetStatePump = false;
+      heaterPendingStop = false;
+      Serial.println("Pump stopped after heater cooldown (0.5s delay)");
+    }
+  }
+
   // 温度读取 (每2秒) - 这里仍使用 currentTime，因为不需要实时性
   if(currentTime - lastTempTime >= 2000) {
     currentTemperature = readTemperature();
@@ -430,8 +463,8 @@ void loop() {
     Serial.println(" C");
   }
 
-  // 温度数据上传 (每5秒) - 这里仍使用 currentTime，因为不需要实时性
-  if(currentTime - lastUploadTime >= 5000) {
+  // 温度数据上传 (每1秒) - 这里仍使用 currentTime，因为不需要实时性
+  if(currentTime - lastUploadTime >= 1000) {
     uploadTemperatureData();
     lastUploadTime = currentTime;
   }
@@ -951,6 +984,10 @@ void finishRevolutionMotor1() {
   if (command1Status == 3 && !motor1Running && !motor2Running) {
     digitalWrite(PIN_VALVE3, HIGH); // 打开电磁阀3
     targetStatePump = true; // 打开水泵
+    // 启动加热器延时保护：先开水泵，1秒后再开加热器
+    heaterPendingStart = true;
+    heaterStartDelayTime = millis();
+    Serial.println("CMD1: Pump ON, heater will start in 1s");
     // 启动往返运动
     motor1Oscillating = true;
     oscillationPhase = 0;
@@ -969,6 +1006,10 @@ void finishRevolutionMotor1() {
   if (command2Status == 3 && !motor1Running && !motor2Running) {
     digitalWrite(PIN_VALVE3, HIGH); // 打开电磁阀3
     targetStatePump = true; // 打开水泵
+    // 启动加热器延时保护：先开水泵，1秒后再开加热器
+    heaterPendingStart = true;
+    heaterStartDelayTime = millis();
+    Serial.println("CMD2: Pump ON, heater will start in 1s");
     // 启动往返运动
     motor1Oscillating = true;
     oscillationPhase = 0;
