@@ -120,6 +120,13 @@ unsigned long maceratingStartTime = 0;     // 粉碎开始时间
 bool maceratorCleanActive = false;         // 粉碎泵自洁是否激活
 unsigned long maceratorCleanStartTime = 0; // 粉碎泵自洁开始时间
 
+// 水位传感器检测相关变量
+unsigned long lastWaterLevelCheckTime = 0; // 上次水位检测时间
+bool waitingForWaterLevelResponse = false; // 等待水位传感器响应标志
+unsigned long waterLevelQueryTime = 0;     // 水位查询发送时间
+bool cleanWaterTankOK = true;              // 清水箱状态 (true=正常, false=缺水)
+bool dirtyWaterTankOK = true;              // 污水箱状态 (true=正常, false=满了)
+
 // 加热器延时控制（防干烧）
 bool heaterPendingStart = false;           // 加热器等待启动标志
 unsigned long heaterStartDelayTime = 0;    // 加热器启动延时计时器
@@ -150,6 +157,10 @@ int motor2RevolutionCount = 0;
 byte rs485Buffer[8];
 int rs485Index = 0;
 
+// 水位传感器接收缓存（6字节）
+byte waterLevelBuffer[6];
+int waterLevelIndex = 0;
+
 // 双相励磁序列表 (两相通电，扭矩大)
 // 对应二进制: 1100, 0110, 0011, 1001
 const byte stepPatternHex[4] = {0x0C, 0x06, 0x03, 0x09};
@@ -169,6 +180,9 @@ const byte cmdDrying[8]    = {0xEE, 0x01, 0x00, 0x05, 0x00, 0x00, 0x00, 0x00}; /
 const byte cmdFlush[8]     = {0xEE, 0x01, 0x00, 0x06, 0x00, 0x00, 0x00, 0x00}; // 冲马桶（15秒）
 const byte cmdMacerating[8]= {0xEE, 0x01, 0x00, 0x07, 0x00, 0x00, 0x00, 0x00}; // 粉碎（10秒）
 const byte cmdMaceratorClean[8]={0xEE, 0x01, 0x00, 0x08, 0x00, 0x00, 0x00, 0x00}; // 粉碎泵自洁（15秒）
+
+// 水位传感器查询指令
+const byte cmdWaterLevelQuery[8] = {0x01, 0x02, 0x00, 0x00, 0x00, 0x04, 0x79, 0xC9}; // 查询水位传感器
 
 // 强电负载指令 (5-12)
 const byte cmdFanOn[8]   = {0xEE, 0x01, 0x00, 0x01, 0x00, 0x01, 0x01, 0x00}; // 风扇开
@@ -215,6 +229,12 @@ void sendHex485(byte data[8]);
 float readTemperature(); // 温度读取函数
 void temperatureToTwoBytes(float temp, byte &highByte, byte &lowByte); // 温度转换函数
 void uploadTemperatureData(); // 温度上传函数
+void queryWaterLevelSensors(); // 查询水位传感器
+void processWaterLevelResponse(byte response[8]); // 处理水位传感器响应
+void onCleanWaterTankOK(); // 清水箱正常处理函数
+void onCleanWaterTankLow(); // 清水箱缺水处理函数
+void onDirtyWaterTankOK(); // 污水箱正常处理函数
+void onDirtyWaterTankFull(); // 污水箱满了处理函数
 
 // ================= 6. 定时器回调函数 =================
 // 定时器中断：延时后触发可控硅（水即热）
@@ -468,6 +488,18 @@ void loop() {
     uploadTemperatureData();
     lastUploadTime = currentTime;
   }
+
+  // 水位传感器查询 (每5秒)
+  if(currentTime - lastWaterLevelCheckTime >= 5000) {
+    queryWaterLevelSensors();
+    lastWaterLevelCheckTime = currentTime;
+  }
+
+  // 检查水位传感器响应超时（500ms）
+  if(waitingForWaterLevelResponse && (currentTime - waterLevelQueryTime >= 500)) {
+    waitingForWaterLevelResponse = false;
+    Serial.println("Water level sensor response timeout");
+  }
 }
 
 // ================= 8. 中断服务函数 (ISR) =================
@@ -512,6 +544,31 @@ void zeroCrossingISR() {
 void handleRS485Commands() {
   while (Serial1.available()) {
     byte receivedByte = Serial1.read();
+
+    // 检测水位传感器响应 (0x01开头，6字节)
+    if (receivedByte == 0x01 && waitingForWaterLevelResponse) {
+      waterLevelBuffer[0] = receivedByte;
+      waterLevelIndex = 1;
+      unsigned long startTime = millis();
+      // 读取剩余5字节，带超时
+      while (waterLevelIndex < 6) {
+        if (Serial1.available()) {
+          waterLevelBuffer[waterLevelIndex++] = Serial1.read();
+        }
+        if (millis() - startTime > 20) { // 20ms 超时
+          waterLevelIndex = 0;
+          return;
+        }
+      }
+      // 收到完整6字节，检查是否是水位传感器数据（前3字节：01 02 01）
+      if (waterLevelIndex == 6 && waterLevelBuffer[1] == 0x02 && waterLevelBuffer[2] == 0x01) {
+        processWaterLevelResponse(waterLevelBuffer);
+        waitingForWaterLevelResponse = false;
+      }
+      waterLevelIndex = 0;
+      return;
+    }
+
     // 简单的帧头检测 (0xEE)
     if (receivedByte == 0xEE) {
       rs485Buffer[0] = receivedByte;
@@ -523,8 +580,8 @@ void handleRS485Commands() {
           rs485Buffer[rs485Index++] = Serial1.read();
         }
         if (millis() - startTime > 20) { // 20ms 超时
-          rs485Index = 0; 
-          return; 
+          rs485Index = 0;
+          return;
         }
       }
       // 收到完整8字节，处理
@@ -1126,4 +1183,89 @@ void uploadTemperatureData() {
   Serial.print("Temperature uploaded: ");
   Serial.print(currentTemperature, 1);
   Serial.println(" C");
+}
+
+// ================= 12. 水位传感器功能 =================
+
+// 查询水位传感器
+void queryWaterLevelSensors() {
+  digitalWrite(DE_RE_Pin, HIGH); // 发送模式
+  delayMicroseconds(20);         // 等待电平稳定
+  Serial1.write(cmdWaterLevelQuery, 8);
+  Serial1.flush();               // 等待发送完成
+  delayMicroseconds(20);
+  digitalWrite(DE_RE_Pin, LOW);  // 切换回接收模式
+
+  waitingForWaterLevelResponse = true;
+  waterLevelQueryTime = millis();
+  Serial.println("Water level query sent");
+}
+
+// 处理水位传感器响应（6字节数据）
+void processWaterLevelResponse(byte response[6]) {
+  // 打印收到的数据
+  Serial.print("Water level response: ");
+  for(int i = 0; i < 6; i++) {
+    if(response[i] < 0x10) Serial.print("0");
+    Serial.print(response[i], HEX);
+    Serial.print(" ");
+  }
+  Serial.println();
+
+  // 解析第4个字节（索引3）的状态位
+  byte statusByte = response[3];
+  bool cleanWaterBit = (statusByte & 0x01);  // bit 0: 清水箱 (1=正常, 0=缺水)
+  bool dirtyWaterBit = (statusByte & 0x02);  // bit 1: 污水箱 (0=正常, 1=满了)
+
+  // 清水箱状态处理
+  if (cleanWaterBit && !cleanWaterTankOK) {
+    // 从缺水恢复到正常
+    cleanWaterTankOK = true;
+    onCleanWaterTankOK();
+    Serial.println("Clean water tank: OK");
+  } else if (!cleanWaterBit && cleanWaterTankOK) {
+    // 从正常变为缺水
+    cleanWaterTankOK = false;
+    onCleanWaterTankLow();
+    Serial.println("Clean water tank: LOW!");
+  }
+
+  // 污水箱状态处理
+  if (!dirtyWaterBit && !dirtyWaterTankOK) {
+    // 从满了恢复到正常
+    dirtyWaterTankOK = true;
+    onDirtyWaterTankOK();
+    Serial.println("Dirty water tank: OK");
+  } else if (dirtyWaterBit && dirtyWaterTankOK) {
+    // 从正常变为满了
+    dirtyWaterTankOK = false;
+    onDirtyWaterTankFull();
+    Serial.println("Dirty water tank: FULL!");
+  }
+}
+
+// === 清水箱和污水箱状态处理函数（预留） ===
+
+// 清水箱正常
+void onCleanWaterTankOK() {
+  // TODO: 清水箱恢复正常时的处理逻辑
+  // 例如：恢复清洗功能
+}
+
+// 清水箱缺水
+void onCleanWaterTankLow() {
+  // TODO: 清水箱缺水时的处理逻辑
+  // 例如：禁止清洗功能、发出警报
+}
+
+// 污水箱正常
+void onDirtyWaterTankOK() {
+  // TODO: 污水箱恢复正常时的处理逻辑
+  // 例如：恢复排水功能
+}
+
+// 污水箱满了
+void onDirtyWaterTankFull() {
+  // TODO: 污水箱满了时的处理逻辑
+  // 例如：禁止排水功能、发出警报
 }
