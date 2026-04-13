@@ -595,18 +595,12 @@ void handleRS485Commands() {
 }
 
 void sendHex485(byte data[8]) {
-  digitalWrite(DE_RE_Pin, HIGH); // 发送模式（此时外部设备无法发送，缓冲里只有自己的回环）
+  digitalWrite(DE_RE_Pin, HIGH); // 切换为发送模式
   delayMicroseconds(20);         // 等待电平稳定
   Serial1.write(data, 8);
-  Serial1.flush();               // 等待发送完成，9600bps发8字节约需8.3ms
-  // DE_RE 仍为 HIGH，外部无法发数据，此时缓冲里只有自己的8字节回环
-  // 等待回环字节全部到达后精确丢弃（9600bps 8字节约需8.3ms，等10ms）
-  // 注意：此处 delayMicroseconds 最大约16383us，故用两次
-  delayMicroseconds(10000); // 等待10ms
-  for (int i = 0; i < 8; i++) {
-    if (Serial1.available()) Serial1.read();
-  }
-  digitalWrite(DE_RE_Pin, LOW);  // 丢弃完毕后再切回接收模式
+  Serial1.flush();               // 等待串口字节彻底发送完毕
+  delayMicroseconds(20);         // 极短延时确保引脚状态
+  digitalWrite(DE_RE_Pin, LOW);  // 【关键】立刻切换回接收模式！千万不要 delay 10ms！
   Serial.println("Ack Sent");
 }
 
@@ -1196,17 +1190,12 @@ void uploadTemperatureData() {
 
 // 查询水位传感器
 void queryWaterLevelSensors() {
-  digitalWrite(DE_RE_Pin, HIGH); // 发送模式（此时外部设备无法发送）
+  digitalWrite(DE_RE_Pin, HIGH); // 切换为发送模式
   delayMicroseconds(20);         // 等待电平稳定
   Serial1.write(cmdWaterLevelQuery, 8);
-  Serial1.flush();               // 等待发送完成
-  // DE_RE 仍为 HIGH，外部无法发数据，缓冲里只有自己的8字节回环
-  // 精确丢弃8字节，不多清，避免误删传感器响应
-  delayMicroseconds(10000); // 等待10ms，确保回环字节全部到达
-  for (int i = 0; i < 8; i++) {
-    if (Serial1.available()) Serial1.read();
-  }
-  digitalWrite(DE_RE_Pin, LOW);  // 丢弃完毕后再切回接收模式
+  Serial1.flush();               // 等待串口字节彻底发送完毕
+  delayMicroseconds(20);         // 极短延时确保引脚状态
+  digitalWrite(DE_RE_Pin, LOW);  // 【关键】立刻切回接收模式，准备接收传感器的秒回数据
 
   waitingForWaterLevelResponse = true;
   waterLevelQueryTime = millis();
