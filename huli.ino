@@ -619,7 +619,6 @@ void processHexCommand(byte cmd[8]) {
     deodorizeActive = true;
     deodorizeStartTime = millis();
     Serial.println("CMD: Deodorize started (15 seconds)");
-    sendHex485(cmd);
     digitalWrite(PIN_DEODOR_FAN, HIGH);
     return;
   }
@@ -631,7 +630,6 @@ void processHexCommand(byte cmd[8]) {
     dryingActive = true;
     dryingStartTime = millis();
     Serial.println("CMD: Drying started (15 seconds)");
-    sendHex485(cmd);
     digitalWrite(PIN_DRY_FAN, HIGH);
     return;
   }
@@ -644,7 +642,6 @@ void processHexCommand(byte cmd[8]) {
     flushStatus = 1;  // 进入阶段1（冲水）
     flushStartTime = millis();
     Serial.println("CMD: Flush started - Stage 1 (15 seconds)");
-    sendHex485(cmd);
     return;
   }
 
@@ -654,7 +651,6 @@ void processHexCommand(byte cmd[8]) {
     maceratingActive = true;
     maceratingStartTime = millis();
     Serial.println("CMD: Macerating started (10 seconds)");
-    sendHex485(cmd);
     return;
   }
 
@@ -666,7 +662,6 @@ void processHexCommand(byte cmd[8]) {
     maceratorCleanActive = true;
     maceratorCleanStartTime = millis();
     Serial.println("CMD: Macerator clean started (15 seconds)");
-    sendHex485(cmd);
     return;
   }
 
@@ -677,135 +672,135 @@ void processHexCommand(byte cmd[8]) {
     fanTriggerEnabled = true;
     fanDelayMicros = 6000; // 延时8ms，导通2ms，功率约20%
     Serial.println("CMD: Fan ON 20% (Wait ZC)");
-    sendHex485(cmd); return;
+    return;
   }
   else if (memcmp(cmd, cmdFanOff, 8) == 0) {
     fanTriggerEnabled = false;
     fanDelayMicros = 0;
     Serial.println("CMD: Fan OFF (Wait ZC)");
-    sendHex485(cmd); return;
+    return;
   }
-  
+
   // 2. 水泵控制
   else if (memcmp(cmd, cmdPumpOn, 8) == 0) {
     targetStatePump = true;
     Serial.println("CMD: Pump ON (Wait ZC)");
-    sendHex485(cmd); return;
+    return;
   }
   else if (memcmp(cmd, cmdPumpOff, 8) == 0) {
     targetStatePump = false;
     Serial.println("CMD: Pump OFF (Wait ZC)");
-    sendHex485(cmd); return;
+    return;
   }
-  
+
   // 3. 水即热控制 (新版：支持功率调节)
   else if (memcmp(cmd, cmdHeatOff_New, 8) == 0) {
     heaterTriggerEnabled = false;
     heaterDelayMicros = 0;
     Serial.println("CMD: Heater OFF");
-    sendHex485(cmd); return;
+    return;
   }
   else if (memcmp(cmd, cmdHeat20, 8) == 0) {
     heaterTriggerEnabled = true;
     heaterDelayMicros = 8000; // 延时8ms，导通2ms，功率约20%
     Serial.println("CMD: Heater 20%");
-    sendHex485(cmd); return;
+    return;
   }
   else if (memcmp(cmd, cmdHeat40, 8) == 0) {
     heaterTriggerEnabled = true;
     heaterDelayMicros = 6000; // 延时6ms，导通4ms，功率约40%
     Serial.println("CMD: Heater 40%");
-    sendHex485(cmd); return;
+    return;
   }
   else if (memcmp(cmd, cmdHeat60, 8) == 0) {
     heaterTriggerEnabled = true;
     heaterDelayMicros = 4000; // 延时4ms，导通6ms，功率约60%
     Serial.println("CMD: Heater 60%");
-    sendHex485(cmd); return;
+    return;
   }
   else if (memcmp(cmd, cmdHeat80, 8) == 0) {
     heaterTriggerEnabled = true;
     heaterDelayMicros = 2000; // 延时2ms，导通8ms，功率约80%
     Serial.println("CMD: Heater 80%");
-    sendHex485(cmd); return;
+    return;
   }
   else if (memcmp(cmd, cmdHeat100, 8) == 0) {
     heaterTriggerEnabled = true;
     heaterDelayMicros = 100; // 几乎立即触发，功率约100%
     Serial.println("CMD: Heater 100%");
-    sendHex485(cmd); return;
+    return;
   }
 
   // 4. 粉碎泵控制
   else if (memcmp(cmd, cmdMacOn, 8) == 0) {
     targetStateMacerator = true;
     Serial.println("CMD: Macerator ON (Wait ZC)");
-    sendHex485(cmd); return;
+    return;
   }
   else if (memcmp(cmd, cmdMacOff, 8) == 0) {
     targetStateMacerator = false;
     Serial.println("CMD: Macerator OFF (Wait ZC)");
-    sendHex485(cmd); return;
+    return;
   }
 
   // 5. 烘干风扇控制
   else if (memcmp(cmd, cmdDryFanOn, 8) == 0) {
     digitalWrite(PIN_DRY_FAN, HIGH);
     Serial.println("CMD: Dry Fan ON");
-    sendHex485(cmd); return;
+    return;
   }
   else if (memcmp(cmd, cmdDryFanOff, 8) == 0) {
     digitalWrite(PIN_DRY_FAN, LOW);
     Serial.println("CMD: Dry Fan OFF");
-    sendHex485(cmd); return;
+    return;
   }
 
   // 6. 除臭风扇控制
   else if (memcmp(cmd, cmdDeodorFanOn, 8) == 0) {
     digitalWrite(PIN_DEODOR_FAN, HIGH);
     Serial.println("CMD: Deodorizing Fan ON");
-    sendHex485(cmd); return;
+    return;
   }
   else if (memcmp(cmd, cmdDeodorFanOff, 8) == 0) {
     digitalWrite(PIN_DEODOR_FAN, LOW);
     Serial.println("CMD: Deodorizing Fan OFF");
-    sendHex485(cmd); return;
+    return;
   }
 
   // 7. 电磁阀1控制
   else if (memcmp(cmd, cmdValve1On, 8) == 0) {
     digitalWrite(PIN_VALVE1, HIGH);
     Serial.println("CMD: Valve 1 ON");
-    sendHex485(cmd); return;
+    return;
   }
   else if (memcmp(cmd, cmdValve1Off, 8) == 0) {
     digitalWrite(PIN_VALVE1, LOW);
     Serial.println("CMD: Valve 1 OFF");
-    sendHex485(cmd); return;
+    return;
   }
 
   // 8. 电磁阀2控制
   else if (memcmp(cmd, cmdValve2On, 8) == 0) {
     digitalWrite(PIN_VALVE2, HIGH);
     Serial.println("CMD: Valve 2 ON");
-    sendHex485(cmd); return;
+    return;
   }
   else if (memcmp(cmd, cmdValve2Off, 8) == 0) {
     digitalWrite(PIN_VALVE2, LOW);
     Serial.println("CMD: Valve 2 OFF");
-    sendHex485(cmd); return;
+    return;
   }
 
   // 9. 电磁阀3控制
   else if (memcmp(cmd, cmdValve3On, 8) == 0) {
     digitalWrite(PIN_VALVE3, HIGH);
     Serial.println("CMD: Valve 3 ON");
-    sendHex485(cmd); return;
+    return;
   }
   else if (memcmp(cmd, cmdValve3Off, 8) == 0) {
     digitalWrite(PIN_VALVE3, LOW);
     Serial.println("CMD: Valve 3 OFF");
-    sendHex485(cmd); return;
+    return;
   }
 
   // --- B. 步进电机控制指令 ---
@@ -821,7 +816,6 @@ void processHexCommand(byte cmd[8]) {
     motor1Direction = true; // M1 正
     motor2Direction = true;  // M2 正
     motor1Enabled = true; motor2Enabled = true;
-    sendHex485(cmd);
   }
   else if (memcmp(cmd, cmdAction2, 8) == 0) {
     motor1Running = false; motor2Running = false;
@@ -829,7 +823,6 @@ void processHexCommand(byte cmd[8]) {
     motor1Direction = true; // M1 正
     motor2Direction = false; // M2 逆
     motor1Enabled = true; motor2Enabled = true;
-    sendHex485(cmd);
   }
   else if (memcmp(cmd, cmdAction3, 8) == 0) {
     motor1Running = false; motor2Running = false;
@@ -839,31 +832,26 @@ void processHexCommand(byte cmd[8]) {
     nextTargetSteps1 = 300;  // 1圈
     nextTargetSteps2 = 300;  // 1圈
     motor1Enabled = true; motor2Enabled = true;
-    sendHex485(cmd);
   }
   else if (memcmp(cmd, motor1FwdCmd, 8) == 0) {
     motor1Running = false;
     motor1Direction = true;
     motor1Enabled = true;
-    sendHex485(cmd);
   }
   else if (memcmp(cmd, motor1RevCmd, 8) == 0) {
-    motor1Running = false; 
-    motor1Direction = false; 
+    motor1Running = false;
+    motor1Direction = false;
     motor1Enabled = true;
-    sendHex485(cmd);
   }
   else if (memcmp(cmd, motor2FwdCmd, 8) == 0) {
-    motor2Running = false; 
-    motor2Direction = true; 
+    motor2Running = false;
+    motor2Direction = true;
     motor2Enabled = true;
-    sendHex485(cmd);
   }
   else if (memcmp(cmd, motor2RevCmd, 8) == 0) {
-    motor2Running = false; 
-    motor2Direction = false; 
+    motor2Running = false;
+    motor2Direction = false;
     motor2Enabled = true;
-    sendHex485(cmd);
   }
 }
 
