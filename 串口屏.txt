@@ -1,0 +1,225 @@
+function on_init()
+	local Bt_data = uart_get_baudrate()
+    -- 如果返回值为空或为0，则默认设置为9600
+    if Bt_data == nil or Bt_data == 0 then
+        uart_set_baudrate(9600)
+        Bt_data = 9600
+    end
+end
+
+-- function on_uart_recv_data(packet, port)                                  --      Ϣ ĺ   
+-- 	local leng = #packet
+-- 	receive={}
+-- 	for i=0,leng do
+-- 		packet[i]=string.char(packet[i])
+-- 		if i==0 then 
+-- 			receive=packet[i]
+-- 		else
+-- 			receive=receive..packet[i]
+-- 		end
+-- 	end
+-- 	set_text(0,7,receive)	
+-- end
+-- function on_uart_recv_data(packet, port)
+--     -- 1) 把字节数组拼接成字符串（不修改原 packet）
+--     local leng = #packet
+--     local start_idx = (packet[1] == nil and packet[0] ~= nil) and 0 or 1  -- 兼容 0/1 起始下标
+--     local bytes = {}
+--     local k = 1
+--     for i = start_idx, start_idx + leng - 1 do
+--         local b = packet[i]
+--         if b ~= nil then
+--             bytes[k] = string.char(b)
+--             k = k + 1
+--         end
+--     end
+--     local receive = table.concat(bytes)
+
+--     -- 2) 显示收到的数据
+--     set_text(0, 7, receive)
+
+--     -- 3) 判断并执行 internal_lua_cmd
+--     if receive == "hellow" then
+--         internal_lua_cmd({0xEE, 0xB1, 0x00, 0x00, 0x01, 0xFF, 0xFC, 0xFF, 0xFF})
+--     end
+-- end
+-- 把字节表安全转成字符串（兼容 0/1 起始索引）
+-- local function bytes_to_string(pkt, len)
+--     local out = {}
+--     if pkt[0] ~= nil then            -- 0 起始：有效下标 0..len-1
+--         for i = 0, len - 1 do
+--             out[#out+1] = string.char(pkt[i])
+--         end
+--     else                              -- 1 起始：有效下标 1..len
+--         for i = 1, len do
+--             out[#out+1] = string.char(pkt[i])
+--         end
+--     end
+--     return table.concat(out)
+-- end
+
+-- function on_uart_recv_data(packet, port)
+--     local leng = #packet
+--     local receive = bytes_to_string(packet, leng)
+
+--     -- 去掉末尾的空白(\r \n \t 空格)和 NUL，避免比较失败
+--     receive = receive:gsub("\0", ""):gsub("%s+$", "")
+
+--     set_text(0, 7, receive)
+
+--     if receive == "hellow" then
+--         internal_lua_cmd({0xEE, 0xB1, 0x00, 0x00, 0x01, 0xFF, 0xFC, 0xFF, 0xFF})
+--     end
+-- end
+
+-- function on_uart_recv_data(packet, port)
+--     local hex_str = ""        -- 用于拼接16进制显示
+--     local data_bytes = {}     -- 存放原始字节数据（0-255）
+--     local leng = 0            -- 实际字节长度
+--     local start_idx = 0       -- 默认从0开始
+
+--     -- 自动检测下标起点
+--     if packet[1] ~= nil and packet[0] == nil then
+--         start_idx = 1
+--     end
+
+--     -- 手动统计真实长度
+--     local i = start_idx
+--     while packet[i] ~= nil do
+--         leng = leng + 1
+--         table.insert(data_bytes, packet[i])
+--         hex_str = hex_str .. string.format("%02X ", packet[i])
+--         i = i + 1
+--     end
+
+--     -- 去掉尾部空格
+--     hex_str = hex_str:gsub("%s+$", "")
+
+--     -- 显示收到的16进制数据
+--     set_text(0, 7, hex_str)
+
+--     --------------------------------------------------
+--     -- 🚀 如果需要解析协议，这里可以加入你的逻辑
+--     --------------------------------------------------
+--     if leng == 8 then
+--         local cmd1 = data_bytes[1]
+--         local cmd2 = data_bytes[2]
+--         if cmd1 == 0xAA and cmd2 == 0x55 then
+--             set_text(0, 3, "收到有效指令")
+--         else
+--             set_text(0, 3, "收到8字节数据")
+--         end
+--     else
+--         set_text(0, 3, "接收长度: " .. tostring(leng))
+--     end
+-- end
+function on_control_notify(screen,control,value)
+	if screen == 0 then
+		if control == 1 and value == 1 then
+			set_image(screen,9,"1.jpg")		--设置图片文件
+		elseif control == 2 and value == 1 then
+			set_image(screen,9,"2.jpg")		--设置图片文件
+		elseif control == 3 and value == 1 then
+			set_image(screen,9,"3.jpg")		--设置图片文件
+        elseif control == 4 and value == 1 then
+			set_image(screen,9,"4.jpg")		--设置图片文件
+		elseif control == 5 and value == 1 then
+			set_image(screen,9,"5.jpg")		--设置图片文件
+        elseif control == 6 and value == 1 then
+			set_image(screen,9,"6.jpg")		--设置图片文件
+        end
+	end
+end
+
+
+function on_uart_recv_data(packet, port)
+    local hex_str = ""        -- 用于拼接16进制显示
+    local data_bytes = {}     -- 存放原始字节数据（0-255）
+    local leng = 0
+    local start_idx = 0
+
+    -- 自动检测下标起点（0 或 1）
+    if packet[1] ~= nil and packet[0] == nil then
+        start_idx = 1
+    end
+
+    -- 手动统计真实长度并转为16进制显示
+    local i = start_idx
+    while packet[i] ~= nil do
+        leng = leng + 1
+        local byte = packet[i]
+        table.insert(data_bytes, byte)
+        hex_str = hex_str .. string.format("%02X ", byte)
+        i = i + 1
+    end
+
+    -- 去掉尾部空格
+    hex_str = hex_str:gsub("%s+$", "")
+
+    -- 显示收到的16进制数据
+    set_text(0, 7, hex_str)
+
+    --------------------------------------------------
+    -- 🚀 协议解析逻辑：判断是否温度帧并解析温度
+    --------------------------------------------------
+    if leng == 8 then
+        -- 判断前6字节是否匹配EE 10 00 01 00 01
+        if  data_bytes[1] == 0xEE and
+            data_bytes[2] == 0x10 and
+            data_bytes[3] == 0x00 and
+            data_bytes[4] == 0x01 and
+            data_bytes[5] == 0x00 and
+            data_bytes[6] == 0x01 then
+
+            -- 取出最后两个字节
+            local high = data_bytes[7]
+            local low  = data_bytes[8]
+
+            -- 组合为16位数
+            local raw = high * 256 + low
+
+            -- 处理补码（负数）
+            if raw >= 0x8000 then
+                raw = raw - 0x10000
+            end
+
+            -- 转换为温度，保留一位小数
+            local temp = raw / 10.0
+
+            -- 显示温度值
+            set_text(2, 10, string.format("%.1f°C", temp))  --原先0，8；现使用新屏幕2，10
+        end
+    elseif leng == 6 then
+        -- 判断是否为 01 02 01 开头的控制指令
+        if  data_bytes[1] == 0x01 and
+            data_bytes[2] == 0x02 and
+            data_bytes[3] == 0x01 then
+
+            -- 取出第4个字节
+            local status_byte = data_bytes[4]
+
+            -- 解析bit0（最低位）：控制控件1背景色
+            if (status_byte & 0x01) == 0x01 then
+                set_back_color(0, 3, 0x07E0)  -- 绿色3
+            
+            else
+                set_back_color(0, 3, 0xF800)  -- 红色3
+            
+            end
+
+            -- 解析bit1（倒数第二位）：控制控件2背景色
+            if (status_byte & 0x02) == 0x02 then
+                set_back_color(0, 2, 0xF800)  -- 红色2
+            
+            else
+                set_back_color(0, 2, 0x07E0)  -- 绿色2
+            
+            end
+        end
+    else
+        set_text(0, 8, "接收长度错误: " .. tostring(leng))
+    end    
+end
+
+
+
