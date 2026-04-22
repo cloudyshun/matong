@@ -76,8 +76,19 @@ volatile bool heaterTriggerEnabled = false; // 是否启用加热器
 
 // --- 温度监控相关变量 ---
 float currentTemperature = 0.0;
+float filteredTemperature = 0.0;  // 一阶低通滤波后的温度
 unsigned long lastTempTime = 0;    // 上次温度更新时间
-unsigned long lastUploadTime = 0;  // 上次温度上传时间
+
+// --- PID 水温控制 ---
+#define PID_SETPOINT  38.0f
+#define PID_KP        6.0f
+#define PID_KI        0.05f
+#define PID_KD        1.0f
+
+bool    heaterPidActive = false;
+float   pidIntegral     = 0.0f;
+float   pidLastError    = 0.0f;
+unsigned long lastPidTime = 0;
 
 // --- 步进电机相关变量 ---
 byte currentShiftOutput = 0; // 595当前的输出字节
@@ -120,13 +131,14 @@ unsigned long maceratingStartTime = 0;     // 粉碎开始时间
 bool maceratorCleanActive = false;         // 粉碎泵自洁是否激活
 unsigned long maceratorCleanStartTime = 0; // 粉碎泵自洁开始时间
 
-// 水位传感器检测相关变量
-unsigned long lastWaterLevelCheckTime = 0; // 上次水位检测时间
 unsigned long lastRS485SendTime = 0;       // 上次RS485发送时间（用于避免连包）
-bool waitingForWaterLevelResponse = false; // 等待水位传感器响应标志
-unsigned long waterLevelQueryTime = 0;     // 水位查询发送时间
-bool cleanWaterTankOK = true;              // 清水箱状态 (true=正常, false=缺水)
-bool dirtyWaterTankOK = true;              // 污水箱状态 (true=正常, false=满了)
+
+// 水位传感器相关变量（查询功能已停用，保留变量供编译）
+unsigned long lastWaterLevelCheckTime = 0;
+bool waitingForWaterLevelResponse = false;
+unsigned long waterLevelQueryTime = 0;
+bool cleanWaterTankOK = true;
+bool dirtyWaterTankOK = true;
 
 // 加热器延时控制（防干烧）
 bool heaterPendingStart = false;           // 加热器等待启动标志
@@ -230,6 +242,7 @@ void sendHex485(byte data[8]);
 float readTemperature(); // 温度读取函数
 void temperatureToTwoBytes(float temp, byte &highByte, byte &lowByte); // 温度转换函数
 void uploadTemperatureData(); // 温度上传函数
+void runPidTask();             // PID水温控制+VOFA上报任务
 void queryWaterLevelSensors(); // 查询水位传感器
 void processWaterLevelResponse(byte response[8]); // 处理水位传感器响应
 void onCleanWaterTankOK(); // 清水箱正常处理函数
@@ -363,13 +376,14 @@ void loop() {
 
   // === 检查往返运动10秒超时 ===
   if (motor1Oscillating && !oscillationFinishing) {
-    if (millis() - oscillationStartTime >= 10000) {
+    if (millis() - oscillationStartTime >= 30000) {
       // 10秒到，停止往返，执行结束流程
       Serial.println("Oscillation timeout, starting finish sequence");
       oscillationFinishing = true;
       retractStarted = false;  // 重置缩回标志
 
-      // 关闭加热器和电磁阀3
+      // 关闭PID和加热器，关闭电磁阀3
+      heaterPidActive = false;
       heaterTriggerEnabled = false;
       heaterDelayMicros = 0;
       digitalWrite(PIN_VALVE3, LOW);
@@ -457,11 +471,13 @@ void loop() {
   // === 检查加热器启动延时（防干烧：先开水泵，1秒后再开加热器） ===
   if (heaterPendingStart) {
     if (millis() - heaterStartDelayTime >= 1000) {
-      // 1秒延时到，启动加热器40%功率
-      heaterTriggerEnabled = true;
-      heaterDelayMicros = 6000;  // 40%功率
+      // 1秒延时到，激活PID控制
+      heaterPidActive = true;
+      pidIntegral   = 0.0f;
+      pidLastError  = 0.0f;
+      lastPidTime   = millis();
       heaterPendingStart = false;
-      Serial.println("Heater started (40% power) after 1s delay");
+      Serial.println("Heater PID started after 1s delay");
     }
   }
 
@@ -475,32 +491,20 @@ void loop() {
     }
   }
 
-  // 温度读取 (每2秒) - 这里仍使用 currentTime，因为不需要实时性
-  if(currentTime - lastTempTime >= 2000) {
-    currentTemperature = readTemperature();
-    lastTempTime = currentTime;
-    Serial.print("Current Temperature: ");
-    Serial.print(currentTemperature, 1);
-    Serial.println(" C");
-  }
+  // PID水温控制 + VOFA上报 (每100ms)
+  runPidTask();
 
-  // 温度数据上传 (每1秒) - 这里仍使用 currentTime，因为不需要实时性
-  if(currentTime - lastUploadTime >= 1000) {
-    uploadTemperatureData();
-    lastUploadTime = currentTime;
-  }
+  // 水位传感器查询 - 已停用
+  // if(currentTime - lastWaterLevelCheckTime >= 5000) {
+  //   queryWaterLevelSensors();
+  //   lastWaterLevelCheckTime = currentTime;
+  // }
 
-  // 水位传感器查询 (每5秒)
-  if(currentTime - lastWaterLevelCheckTime >= 5000) {
-    queryWaterLevelSensors();
-    lastWaterLevelCheckTime = currentTime;
-  }
-
-  // 检查水位传感器响应超时（500ms）
-  if(waitingForWaterLevelResponse && (currentTime - waterLevelQueryTime >= 500)) {
-    waitingForWaterLevelResponse = false;
-    Serial.println("Water level sensor response timeout");
-  }
+  // 检查水位传感器响应超时 - 已停用
+  // if(waitingForWaterLevelResponse && (currentTime - waterLevelQueryTime >= 500)) {
+  //   waitingForWaterLevelResponse = false;
+  //   Serial.println("Water level sensor response timeout");
+  // }
 }
 
 // ================= 8. 中断服务函数 (ISR) =================
@@ -1286,4 +1290,63 @@ void onDirtyWaterTankOK() {
 void onDirtyWaterTankFull() {
   // TODO: 污水箱满了时的处理逻辑
   // 例如：禁止排水功能、发出警报
+}
+
+// ================= 13. PID水温控制 + VOFA上报 =================
+// 每100ms调用一次，非阻塞
+// VOFA+ FireWater协议：目标温度,实际温度\n (通过RS485发送给串口屏/上位机)
+void runPidTask() {
+  unsigned long now = millis();
+  if (now - lastPidTime < 100) return;
+  float dt = (now - lastPidTime) / 1000.0f;  // 转换为秒
+  lastPidTime = now;
+
+  // 采样温度 + 一阶低通滤波
+  currentTemperature = readTemperature();
+  filteredTemperature = (0.2f * currentTemperature) + (0.8f * filteredTemperature);
+
+  // --- VOFA+ FireWater 字符串发送 ---
+  // 格式：目标温度,滤波后温度\n
+  digitalWrite(DE_RE_Pin, HIGH);
+  delayMicroseconds(20);
+  Serial1.print(PID_SETPOINT, 1);
+  Serial1.print(",");
+  Serial1.print(filteredTemperature, 1);
+  Serial1.write('\n');        // 真正的换行符 0x0A
+  Serial1.flush();
+  delayMicroseconds(20);
+  digitalWrite(DE_RE_Pin, LOW);
+  lastRS485SendTime = millis();
+
+  // --- PID 计算（使用滤波后温度）---
+  if (!heaterPidActive) {
+    // 加热器未激活时确保关闭
+    heaterTriggerEnabled = false;
+    heaterDelayMicros = 0;
+    return;
+  }
+
+  float error    = PID_SETPOINT - filteredTemperature;
+  pidIntegral   += error * dt;
+  // 积分限幅，防止积分饱和
+  pidIntegral    = constrain(pidIntegral, -50.0f, 50.0f);
+  float derivative = (error - pidLastError) / dt;
+  pidLastError   = error;
+
+  float output = PID_KP * error + PID_KI * pidIntegral + PID_KD * derivative;
+
+  // 将PID输出映射到 heaterDelayMicros
+  // output > 0 表示需要加热，output范围约 0~100 对应延时 8000~100 微秒
+  // output <= 0 表示温度已够高，关闭加热器
+  if (output <= 0.0f) {
+    heaterTriggerEnabled = false;
+    heaterDelayMicros = 0;
+  } else {
+    heaterTriggerEnabled = true;
+    // output越大，延时越小（导通越早，功率越大）
+    // 线性映射：output=1→8000us(≈20%), output=100→100us(≈100%)
+    int delayUs = (int)(8000.0f - (output / 100.0f) * 7900.0f);
+    delayUs = constrain(delayUs, 100, 8000);
+    heaterDelayMicros = (uint16_t)delayUs;
+  }
 }
