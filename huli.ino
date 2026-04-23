@@ -79,15 +79,15 @@ float currentTemperature = 0.0;
 float filteredTemperature = 0.0;  // 一阶低通滤波后的温度
 unsigned long lastTempTime = 0;    // 上次温度更新时间
 
-// --- PID 水温控制 ---
-#define PID_SETPOINT  38.0f
-#define PID_KP        6.0f
-#define PID_KI        0.05f
-#define PID_KD        1.0f
+// --- 滑模控制 水温控制 ---
+#define SMC_SETPOINT  38.0f
+#define SMC_LAMBDA    0.05f   // 积分项系数，影响滑模面斜率
+#define SMC_K_SW      80.0f   // 切换增益，控制趋近速度
+#define SMC_K_EQ      6.0f    // 等效控制增益
 
 bool    heaterPidActive = false;
-float   pidIntegral     = 0.0f;
-float   pidLastError    = 0.0f;
+float   smcIntegral     = 0.0f;
+float   smcLastError    = 0.0f;
 unsigned long lastPidTime = 0;
 
 // --- 步进电机相关变量 ---
@@ -473,8 +473,8 @@ void loop() {
     if (millis() - heaterStartDelayTime >= 1000) {
       // 1秒延时到，激活PID控制
       heaterPidActive = true;
-      pidIntegral   = 0.0f;
-      pidLastError  = 0.0f;
+      smcIntegral   = 0.0f;
+      smcLastError  = 0.0f;
       lastPidTime   = millis();
       heaterPendingStart = false;
       Serial.println("Heater PID started after 1s delay");
@@ -1292,7 +1292,7 @@ void onDirtyWaterTankFull() {
   // 例如：禁止排水功能、发出警报
 }
 
-// ================= 13. PID水温控制 + VOFA上报 =================
+// ================= 13. 滑模控制水温 + VOFA上报 =================
 // 每100ms调用一次，非阻塞
 // VOFA+ FireWater协议：目标温度,实际温度\n (通过RS485发送给串口屏/上位机)
 void runPidTask() {
@@ -1309,7 +1309,7 @@ void runPidTask() {
   // 格式：目标温度,滤波后温度\n
   digitalWrite(DE_RE_Pin, HIGH);
   delayMicroseconds(20);
-  Serial1.print(PID_SETPOINT, 1);
+  Serial1.print(SMC_SETPOINT, 1);
   Serial1.print(",");
   Serial1.print(filteredTemperature, 1);
   Serial1.write('\n');        // 真正的换行符 0x0A
@@ -1318,7 +1318,7 @@ void runPidTask() {
   digitalWrite(DE_RE_Pin, LOW);
   lastRS485SendTime = millis();
 
-  // --- PID 计算（使用滤波后温度）---
+  // --- 滑模控制计算（使用滤波后温度）---
   if (!heaterPidActive) {
     // 加热器未激活时确保关闭
     heaterTriggerEnabled = false;
@@ -1326,24 +1326,28 @@ void runPidTask() {
     return;
   }
 
-  float error    = PID_SETPOINT - filteredTemperature;
-  pidIntegral   += error * dt;
-  // 积分限幅，防止积分饱和
-  pidIntegral    = constrain(pidIntegral, -50.0f, 50.0f);
-  float derivative = (error - pidLastError) / dt;
-  pidLastError   = error;
+  float error    = SMC_SETPOINT - filteredTemperature;
 
-  float output = PID_KP * error + PID_KI * pidIntegral + PID_KD * derivative;
+  // 积分项更新（带限幅，防止积分饱和）
+  smcIntegral   += error * dt;
+  smcIntegral    = constrain(smcIntegral, -100.0f, 100.0f);
 
-  // 将PID输出映射到 heaterDelayMicros
-  // output > 0 表示需要加热，output范围约 0~100 对应延时 8000~100 微秒
-  // output <= 0 表示温度已够高，关闭加热器
+  // 滑模面：s = e + λ∫e dt
+  float s = error + SMC_LAMBDA * smcIntegral;
+
+  // 控制律：u = k_eq * e + k_sw * sign(s)
+  // 等效控制项（k_eq * e）使系统趋向目标，切换项（k_sw * sign(s)）保证在滑模面上滑动
+  float signS = (s > 0.0f) ? 1.0f : ((s < 0.0f) ? -1.0f : 0.0f);
+  float output = SMC_K_EQ * error + SMC_K_SW * signS;
+
+  // 将SMC输出映射到 heaterDelayMicros
+  // output <= 0 表示温度已够高或过热，关闭加热器
+  // output > 0  越大，延时越小（导通越早，功率越大）
   if (output <= 0.0f) {
     heaterTriggerEnabled = false;
     heaterDelayMicros = 0;
   } else {
     heaterTriggerEnabled = true;
-    // output越大，延时越小（导通越早，功率越大）
     // 线性映射：output=1→8000us(≈20%), output=100→100us(≈100%)
     int delayUs = (int)(8000.0f - (output / 100.0f) * 7900.0f);
     delayUs = constrain(delayUs, 100, 8000);
