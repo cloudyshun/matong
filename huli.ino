@@ -131,6 +131,10 @@ unsigned long maceratingStartTime = 0;     // 粉碎开始时间
 bool maceratorCleanActive = false;         // 粉碎泵自洁是否激活
 unsigned long maceratorCleanStartTime = 0; // 粉碎泵自洁开始时间
 
+// 喷嘴自洁功能控制（cmdAction3）
+bool nozzleCleanActive = false;            // 喷嘴自洁是否激活
+unsigned long nozzleCleanStartTime = 0;    // 喷嘴自洁开始时间
+
 unsigned long lastRS485SendTime = 0;       // 上次RS485发送时间（用于避免连包）
 
 // 水位传感器相关变量（查询功能已停用，保留变量供编译）
@@ -468,14 +472,28 @@ void loop() {
     }
   }
 
+  // === 检查喷嘴自洁30秒超时 ===
+  if (nozzleCleanActive) {
+    if (millis() - nozzleCleanStartTime >= 30000) {
+      // 30秒到，关闭加热器、电磁阀3、水泵
+      heaterTriggerEnabled = false;
+      heaterDelayMicros = 0;
+      digitalWrite(PIN_VALVE3, LOW);
+      heaterPendingStop = true;
+      heaterStopDelayTime = millis();
+      nozzleCleanActive = false;
+      Serial.println("Nozzle clean finished (30 seconds elapsed)");
+    }
+  }
+
   // === 检查加热器启动延时（防干烧：先开水泵，1秒后再开加热器） ===
   if (heaterPendingStart) {
     if (millis() - heaterStartDelayTime >= 1000) {
       // 1秒延时到，直接设固定50%功率（阶跃实验，不启动PID）
       heaterTriggerEnabled = true;
-      heaterDelayMicros = 4050;  // 50%功率: 8000 - 0.5*7900 = 4050us
+      heaterDelayMicros = 7820;  // 10%功率
       heaterPendingStart = false;
-      Serial.println("Heater fixed 50% power started after 1s delay");
+      Serial.println("Heater fixed 10% power started after 1s delay");
     }
   }
 
@@ -1131,7 +1149,13 @@ void finishRevolutionMotor2() {
   if (command3Status == 3 && !motor1Running && !motor2Running) {
     digitalWrite(PIN_VALVE3, HIGH); // 打开电磁阀3
     targetStatePump = true; // 打开水泵
-    Serial.println("CMD3: Both motors stopped, Valve 3 ON, Pump ON");
+    // 启动加热器延时保护：先开水泵，1秒后再开加热器
+    heaterPendingStart = true;
+    heaterStartDelayTime = millis();
+    // 启动30秒超时计时
+    nozzleCleanActive = true;
+    nozzleCleanStartTime = millis();
+    Serial.println("CMD3: Both motors stopped, Valve 3 ON, Pump ON, heater will start in 1s");
     command3Status = 0; // 重置状态
   }
 }
