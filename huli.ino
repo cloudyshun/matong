@@ -81,9 +81,9 @@ unsigned long lastTempTime = 0;    // 上次温度更新时间
 
 // --- PID 水温控制 ---
 #define PID_SETPOINT  38.0f
-#define PID_KP        6.0f
+#define PID_KP        0.6f
 #define PID_KI        0.05f
-#define PID_KD        1.0f
+#define PID_KD        0.0f
 
 bool    heaterPidActive = false;
 float   pidIntegral     = 0.0f;
@@ -476,6 +476,7 @@ void loop() {
   if (nozzleCleanActive) {
     if (millis() - nozzleCleanStartTime >= 30000) {
       // 30秒到，关闭加热器、电磁阀3、水泵
+      heaterPidActive = false;
       heaterTriggerEnabled = false;
       heaterDelayMicros = 0;
       digitalWrite(PIN_VALVE3, LOW);
@@ -489,11 +490,12 @@ void loop() {
   // === 检查加热器启动延时（防干烧：先开水泵，1秒后再开加热器） ===
   if (heaterPendingStart) {
     if (millis() - heaterStartDelayTime >= 1000) {
-      // 1秒延时到，直接设固定50%功率（阶跃实验，不启动PID）
-      heaterTriggerEnabled = true;
-      heaterDelayMicros = 7820;  // 10%功率
+      // 1秒延时到，启动PID控制
+      pidIntegral = 0.0f;
+      pidLastError = 0.0f;
+      heaterPidActive = true;
       heaterPendingStart = false;
-      Serial.println("Heater fixed 10% power started after 1s delay");
+      Serial.println("Heater PID started after 1s delay");
     }
   }
 
@@ -1354,26 +1356,48 @@ void runPidTask() {
   }
 
   float error    = PID_SETPOINT - filteredTemperature;
-  pidIntegral   += error * dt;
-  // 积分限幅，防止积分饱和
-  pidIntegral    = constrain(pidIntegral, -50.0f, 50.0f);
+  // 积分分离：误差在10°C以内才累积积分
+  if (fabsf(error) <= 10.0f) {
+    pidIntegral += error * dt;
+    pidIntegral  = constrain(pidIntegral, -50.0f, 50.0f);
+  }
   float derivative = (error - pidLastError) / dt;
   pidLastError   = error;
 
   float output = PID_KP * error + PID_KI * pidIntegral + PID_KD * derivative;
 
-  // 将PID输出映射到 heaterDelayMicros
-  // output > 0 表示需要加热，output范围约 0~100 对应延时 8000~100 微秒
-  // output <= 0 表示温度已够高，关闭加热器
+  // 功率查找表：0%~6%，每0.5%一档，共13个点
+  // 索引0=0%, 索引1=0.5%, ..., 索引12=6%
+  // PID输出范围0~12，线性插值映射到延时
+  static const uint16_t powerTable[13] = {
+    10000, // 0.0%
+     9764, // 0.5%
+     9528, // 1.0%
+     9350, // 1.5%
+     9172, // 2.0%
+     9025, // 2.5%
+     8878, // 3.0%
+     8748, // 3.5%
+     8617, // 4.0%
+     8495, // 4.5%
+     8372, // 5.0%
+     8258, // 5.5%
+     8144, // 6.0%
+  };
+
   if (output <= 0.0f) {
     heaterTriggerEnabled = false;
     heaterDelayMicros = 0;
   } else {
     heaterTriggerEnabled = true;
-    // output越大，延时越小（导通越早，功率越大）
-    // 线性映射：output=1→8000us(≈20%), output=100→100us(≈100%)
-    int delayUs = (int)(8000.0f - (output / 100.0f) * 7900.0f);
-    delayUs = constrain(delayUs, 100, 8000);
-    heaterDelayMicros = (uint16_t)delayUs;
+    float clamped = constrain(output, 0.0f, 12.0f);
+    int idx = (int)clamped;
+    if (idx >= 12) {
+      heaterDelayMicros = powerTable[12];
+    } else {
+      float frac = clamped - idx;
+      float delayF = powerTable[idx] + frac * (powerTable[idx + 1] - powerTable[idx]);
+      heaterDelayMicros = (uint16_t)delayF;
+    }
   }
 }
