@@ -79,6 +79,9 @@ float currentTemperature = 0.0;
 float filteredTemperature = 0.0;  // 一阶低通滤波后的温度
 unsigned long lastTempTime = 0;    // 上次温度更新时间
 
+// --- 水即热固定功率（臀洗/妇洗/自洁通用）---
+#define HEATER_WASH_DELAY_MICROS 7500   // 对应约9%功率（正弦波积分计算）
+
 // --- PID 水温控制 ---
 #define PID_SETPOINT  38.0f
 #define PID_KP        0.6f
@@ -333,7 +336,8 @@ void setup() {
   timer_pause(TIMER2);
   timer_set_prescaler(TIMER2, 71); // 72MHz / (71+1) = 1MHz，即1微秒计数
   timer_set_mode(TIMER2, TIMER_CH1, TIMER_OUTPUT_COMPARE);
-  timer_set_reload(TIMER2, 10000); // 默认10ms
+  timer_set_reload(TIMER2, 65535);           // ARR设足够大，防止计数器在触发前溢出
+  timer_set_compare(TIMER2, TIMER_CH1, 10000); // 默认比较值10ms（未启用时无影响）
   timer_attach_interrupt(TIMER2, TIMER_CH1, heaterTimerCallback);
   // 注意：不在这里启动定时器，而是在过零中断中按需启动
 
@@ -341,7 +345,8 @@ void setup() {
   timer_pause(TIMER3);
   timer_set_prescaler(TIMER3, 71); // 72MHz / (71+1) = 1MHz，即1微秒计数
   timer_set_mode(TIMER3, TIMER_CH1, TIMER_OUTPUT_COMPARE);
-  timer_set_reload(TIMER3, 10000); // 默认10ms
+  timer_set_reload(TIMER3, 65535);           // ARR设足够大，防止计数器在触发前溢出
+  timer_set_compare(TIMER3, TIMER_CH1, 10000); // 默认比较值10ms（未启用时无影响）
   timer_attach_interrupt(TIMER3, TIMER_CH1, fanTimerCallback);
   // 注意：不在这里启动定时器，而是在过零中断中按需启动
 
@@ -490,19 +495,18 @@ void loop() {
   // === 检查加热器启动延时（防干烧：先开水泵，1秒后再开加热器） ===
   if (heaterPendingStart) {
     if (millis() - heaterStartDelayTime >= 1000) {
-      // 1秒延时到，启动PID控制
-      pidIntegral = 0.0f;
-      pidLastError = 0.0f;
-      heaterPidActive = true;
+      // 1秒延时到，固定功率启动加热器
+      heaterTriggerEnabled = true;
+      heaterDelayMicros = HEATER_WASH_DELAY_MICROS;
       heaterPendingStart = false;
-      Serial.println("Heater PID started after 1s delay");
+      Serial.println("Heater ON 10% after 1s delay");
     }
   }
 
-  // === 检查加热器关闭延时（防干烧：先关加热器，0.5秒后再关水泵） ===
+  // === 检查加热器关闭延时（防干烧：先关加热器，2秒后再关水泵） ===
   if (heaterPendingStop) {
     if (millis() - heaterStopDelayTime >= 500) {
-      // 0.5秒延时到，关闭水泵
+      // 1秒延时到，关闭水泵
       targetStatePump = false;
       heaterPendingStop = false;
       Serial.println("Pump stopped after heater cooldown (0.5s delay)");
@@ -535,7 +539,7 @@ void zeroCrossingISR() {
     digitalWrite(PIN_FAN, HIGH);
 
     // 设置定时器延时时间并启动
-    timer_set_reload(TIMER3, fanDelayMicros);
+    timer_set_compare(TIMER3, TIMER_CH1, fanDelayMicros);
     timer_set_count(TIMER3, 0); // 重置计数器
     timer_resume(TIMER3); // 启动定时器
   } else {
@@ -553,7 +557,7 @@ void zeroCrossingISR() {
     digitalWrite(PIN_HEATER, HIGH);
 
     // 设置定时器延时时间并启动
-    timer_set_reload(TIMER2, heaterDelayMicros);
+    timer_set_compare(TIMER2, TIMER_CH1, heaterDelayMicros);
     timer_set_count(TIMER2, 0); // 重置计数器
     timer_resume(TIMER2); // 启动定时器
   } else {
@@ -1066,7 +1070,7 @@ void finishRevolutionMotor1() {
   if (command1Status == 3 && !motor1Running && !motor2Running) {
     digitalWrite(PIN_VALVE3, HIGH); // 打开电磁阀3
     targetStatePump = true; // 打开水泵
-    // 启动加热器延时保护：先开水泵，1秒后再开加热器
+    // 防干烧：先开水泵，1秒后再开加热器
     heaterPendingStart = true;
     heaterStartDelayTime = millis();
     Serial.println("CMD1: Pump ON, heater will start in 1s");
@@ -1088,7 +1092,7 @@ void finishRevolutionMotor1() {
   if (command2Status == 3 && !motor1Running && !motor2Running) {
     digitalWrite(PIN_VALVE3, HIGH); // 打开电磁阀3
     targetStatePump = true; // 打开水泵
-    // 启动加热器延时保护：先开水泵，1秒后再开加热器
+    // 防干烧：先开水泵，1秒后再开加热器
     heaterPendingStart = true;
     heaterStartDelayTime = millis();
     Serial.println("CMD2: Pump ON, heater will start in 1s");
@@ -1151,13 +1155,13 @@ void finishRevolutionMotor2() {
   if (command3Status == 3 && !motor1Running && !motor2Running) {
     digitalWrite(PIN_VALVE3, HIGH); // 打开电磁阀3
     targetStatePump = true; // 打开水泵
-    // 启动加热器延时保护：先开水泵，1秒后再开加热器
+    // 防干烧：先开水泵，1秒后再开加热器
     heaterPendingStart = true;
     heaterStartDelayTime = millis();
     // 启动30秒超时计时
     nozzleCleanActive = true;
     nozzleCleanStartTime = millis();
-    Serial.println("CMD3: Both motors stopped, Valve 3 ON, Pump ON, heater will start in 1s");
+    Serial.println("CMD3: Pump ON, heater will start in 1s");
     command3Status = 0; // 重置状态
   }
 }
