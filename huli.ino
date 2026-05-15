@@ -489,7 +489,7 @@ void loop() {
     if (millis() - heaterStartDelayTime >= 1000) {
       // 1秒延时到，启动水即热（50%功率）
       heaterTriggerEnabled = true;
-      heaterDelayMicros = 5000;
+      heaterDelayMicros = 2020;
       heaterPendingStart = false;
       Serial.println("Heater started after 1s delay (50% power)");
     }
