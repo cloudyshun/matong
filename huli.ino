@@ -78,24 +78,16 @@ float currentTemperature = 0.0;
 float filteredTemperature = 0.0;  // 一阶低通滤波后的温度
 unsigned long lastTempTime = 0;    // 上次温度更新时间
 
-// --- PID 水温控制 --- [归一化PID改动1] PID参数改为0~1输出对应参数(与Simulink一致)
+// --- PID 水温控制 ---
 #define PID_SETPOINT  38.0f
-#define PID_KP        0.05f
-#define PID_KI        0.005f
-#define PID_KD        0.0f
+#define PID_KP        6.0f
+#define PID_KI        0.05f
+#define PID_KD        1.0f
 
 bool    heaterPidActive = false;
 float   pidIntegral     = 0.0f;
 float   pidLastError    = 0.0f;
 unsigned long lastPidTime = 0;
-float   lastHeaterDuty = 0.0f;  // [归一化PID改动1] 最近一次设置的归一化调功量(0~1)，用于VOFA上报
-
-// --- [调试软限温] 温度保护参数 ---
-#define TEMP_SOFT_LIMIT  39.0f   // 软限温：达到后临时关闭加热duty，但不关闭PID
-#define TEMP_RESUME      38.0f   // 软限温恢复：温度降到该值以下后允许PID正常输出
-#define TEMP_HARD_LIMIT  45.0f   // 绝对硬保护：关闭PID并锁死加热
-
-bool heaterSoftLimited = false;  // [调试软限温] true=当前处于软限温状态(强制duty=0)
 
 // 水即热装置移相调压控制
 volatile uint16_t heaterDelayMicros = 5000; // 延时时间(微秒)，5000=50%功率，100=100%，9900=0%
@@ -258,8 +250,6 @@ float readTemperature(); // 温度读取函数
 void temperatureToTwoBytes(float temp, byte &highByte, byte &lowByte); // 温度转换函数
 void uploadTemperatureData(); // 温度上传函数
 void runPidTask();             // PID水温控制+VOFA上报任务
-void setHeaterDuty(float duty);            // [归一化PID改动2] 归一化调功量(0~1)设置
-void resetHeaterPid();                     // [PID改动2] PID状态复位
 void queryWaterLevelSensors(); // 查询水位传感器
 void processWaterLevelResponse(byte response[8]); // 处理水位传感器响应
 void onCleanWaterTankOK(); // 清水箱正常处理函数
@@ -394,10 +384,10 @@ void loop() {
       oscillationFinishing = true;
       retractStarted = false;  // 重置缩回标志
 
-      // 关闭PID和加热器，关闭电磁阀3 [归一化PID改动] 统一用setHeaterDuty(0)关闭
+      // 关闭PID和加热器，关闭电磁阀3
       heaterPidActive = false;
-      setHeaterDuty(0.0f);
-      resetHeaterPid();
+      heaterTriggerEnabled = false;
+      heaterDelayMicros = 0;
       digitalWrite(PIN_VALVE3, LOW);
 
       // 启动水泵关闭延时：先关加热器，0.5秒后再关水泵
@@ -483,10 +473,9 @@ void loop() {
   // === 检查喷嘴自洁30秒超时 ===
   if (nozzleCleanActive) {
     if (millis() - nozzleCleanStartTime >= 30000) {
-      // 30秒到，关闭加热器、电磁阀3、水泵 [归一化PID改动]
-      heaterPidActive = false;
-      setHeaterDuty(0.0f);
-      resetHeaterPid();
+      // 30秒到，关闭加热器、电磁阀3、水泵
+      heaterTriggerEnabled = false;
+      heaterDelayMicros = 0;
       digitalWrite(PIN_VALVE3, LOW);
       heaterPendingStop = true;
       heaterStopDelayTime = millis();
@@ -495,15 +484,14 @@ void loop() {
     }
   }
 
-  // === 检查加热器启动延时（防干烧：先开水泵，1秒后再开加热器） === [PID改动3] 改为启动PID闭环
+  // === 检查加热器启动延时（防干烧：先开水泵，1秒后再开加热器） ===
   if (heaterPendingStart) {
     if (millis() - heaterStartDelayTime >= 1000) {
-      // 1秒延时到，启动PID闭环水温控制 (归一化duty输出)
-      resetHeaterPid();
-      heaterPidActive = true;
-      setHeaterDuty(0.0f);
+      // 1秒延时到，启动水即热（50%功率）
+      heaterTriggerEnabled = true;
+      heaterDelayMicros = 5000;
       heaterPendingStart = false;
-      Serial.println("Heater PID started after 1s delay");
+      Serial.println("Heater started after 1s delay (50% power)");
     }
   }
 
@@ -722,47 +710,41 @@ void processHexCommand(byte cmd[8]) {
     sendHex485(cmd); return;
   }
   
-  // 3. 水即热控制 (支持归一化调功量) [归一化PID改动] 手动指令先关闭PID，再设置duty
+  // 3. 水即热控制 (支持功率调节)
   else if (memcmp(cmd, cmdHeatOff_New, 8) == 0) {
-    heaterPidActive = false;
-    resetHeaterPid();
-    setHeaterDuty(0.0f);
+    heaterTriggerEnabled = false;
+    heaterDelayMicros = 0;
     Serial.println("CMD: Heater OFF");
     sendHex485(cmd); return;
   }
   else if (memcmp(cmd, cmdHeat20, 8) == 0) {
-    heaterPidActive = false;
-    resetHeaterPid();
-    setHeaterDuty(0.2f);
-    Serial.println("CMD: Heater duty 0.2");
+    heaterTriggerEnabled = true;
+    heaterDelayMicros = 8000; // 延时8ms，导通2ms，功率约20%
+    Serial.println("CMD: Heater 20%");
     sendHex485(cmd); return;
   }
   else if (memcmp(cmd, cmdHeat40, 8) == 0) {
-    heaterPidActive = false;
-    resetHeaterPid();
-    setHeaterDuty(0.4f);
-    Serial.println("CMD: Heater duty 0.4");
+    heaterTriggerEnabled = true;
+    heaterDelayMicros = 6000; // 延时6ms，导通4ms，功率约40%
+    Serial.println("CMD: Heater 40%");
     sendHex485(cmd); return;
   }
   else if (memcmp(cmd, cmdHeat60, 8) == 0) {
-    heaterPidActive = false;
-    resetHeaterPid();
-    setHeaterDuty(0.6f);
-    Serial.println("CMD: Heater duty 0.6");
+    heaterTriggerEnabled = true;
+    heaterDelayMicros = 4000; // 延时4ms，导通6ms，功率约60%
+    Serial.println("CMD: Heater 60%");
     sendHex485(cmd); return;
   }
   else if (memcmp(cmd, cmdHeat80, 8) == 0) {
-    heaterPidActive = false;
-    resetHeaterPid();
-    setHeaterDuty(0.8f);
-    Serial.println("CMD: Heater duty 0.8");
+    heaterTriggerEnabled = true;
+    heaterDelayMicros = 2000; // 延时2ms，导通8ms，功率约80%
+    Serial.println("CMD: Heater 80%");
     sendHex485(cmd); return;
   }
   else if (memcmp(cmd, cmdHeat100, 8) == 0) {
-    heaterPidActive = false;
-    resetHeaterPid();
-    setHeaterDuty(1.0f);
-    Serial.println("CMD: Heater duty 1.0");
+    heaterTriggerEnabled = true;
+    heaterDelayMicros = 100; // 几乎立即触发，功率约100%
+    Serial.println("CMD: Heater 100%");
     sendHex485(cmd); return;
   }
 
@@ -1324,8 +1306,7 @@ void onDirtyWaterTankFull() {
 
 // ================= 13. PID水温控制 + VOFA上报 =================
 // 每100ms调用一次，非阻塞
-// [归一化PID改动3] PID 输出统一为归一化调功量 duty (0~1)，与 Simulink 仿真一致
-// VOFA+ FireWater协议：目标温度,原始温度,滤波温度,duty,heaterDelayMicros,heaterPidActive\n
+// VOFA+ FireWater协议：目标温度,实际温度\n (通过RS485发送给串口屏/上位机)
 void runPidTask() {
   unsigned long now = millis();
   if (now - lastPidTime < 100) return;
@@ -1339,66 +1320,11 @@ void runPidTask() {
     filteredTemperature = currentTemperature;
     tempFilterInitialized = true;
   } else {
-    filteredTemperature = 0.5f * currentTemperature + 0.5f * filteredTemperature;
+    filteredTemperature = 0.2f * currentTemperature + 0.8f * filteredTemperature;
   }
 
-  // --- [安全保护] NTC异常判断 ---
-  if (currentTemperature < 0.0f || currentTemperature > 80.0f) {
-    heaterPidActive = false;
-    setHeaterDuty(0.0f);
-    resetHeaterPid();
-    Serial.println("ERROR: NTC temperature abnormal, heater stopped");
-    // 仍发送 VOFA 数据，便于上位机观察
-    digitalWrite(DE_RE_Pin, HIGH);
-    delayMicroseconds(20);
-    Serial1.print(PID_SETPOINT, 1);
-    Serial1.print(",");
-    Serial1.print(currentTemperature, 1);
-    Serial1.print(",");
-    Serial1.print(filteredTemperature, 1);
-    Serial1.print(",");
-    Serial1.print(lastHeaterDuty, 3);
-    Serial1.print(",");
-    Serial1.print(heaterDelayMicros);
-    Serial1.print(",");
-    Serial1.print(heaterPidActive ? 1 : 0);
-    Serial1.print(",");
-    Serial1.print(heaterSoftLimited ? 1 : 0);  // [VOFA输出扩展] 软限温状态
-    Serial1.write('\n');
-    Serial1.flush();
-    delayMicroseconds(20);
-    digitalWrite(DE_RE_Pin, LOW);
-    lastRS485SendTime = millis();
-    return;
-  }
-
-  // --- [调试软限温] 达到软限温阈值，只关闭加热输出，不关闭PID ---
-  if (currentTemperature >= TEMP_SOFT_LIMIT) {
-    heaterSoftLimited = true;
-    setHeaterDuty(0.0f);
-    pidIntegral = 0.0f;   // 防止积分继续累积
-    Serial.println("DEBUG SOFT LIMIT: heater duty forced to 0");
-  }
-
-  // --- [软限温恢复] 温度降到恢复阈值以下，允许PID继续控制 ---
-  if (heaterSoftLimited && currentTemperature <= TEMP_RESUME) {
-    heaterSoftLimited = false;
-    pidIntegral = 0.0f;
-    pidLastError = PID_SETPOINT - filteredTemperature;
-    Serial.println("DEBUG SOFT LIMIT RELEASED: PID output enabled");
-  }
-
-  // --- [绝对硬保护] 温度过高时才真正关闭PID并锁死加热 ---
-  if (currentTemperature >= TEMP_HARD_LIMIT || filteredTemperature >= TEMP_HARD_LIMIT) {
-    heaterPidActive = false;
-    heaterSoftLimited = false;
-    setHeaterDuty(0.0f);
-    resetHeaterPid();
-    Serial.println("HARD WARNING: temperature over hard limit, heater locked off");
-    return;
-  }
-
-  // --- [VOFA输出扩展] VOFA+ FireWater 字符串发送 (duty 用于与 Simulink u(t) 对比) ---
+  // --- VOFA+ FireWater 字符串发送 ---
+  // 格式：目标温度,原始温度,滤波温度\n
   digitalWrite(DE_RE_Pin, HIGH);
   delayMicroseconds(20);
   Serial1.print(PID_SETPOINT, 1);
@@ -1407,89 +1333,33 @@ void runPidTask() {
   Serial1.print(",");
   Serial1.print(filteredTemperature, 1);
   Serial1.print(",");
-  Serial1.print(lastHeaterDuty, 3);
-  Serial1.print(",");
-  Serial1.print(heaterDelayMicros);
-  Serial1.print(",");
-  Serial1.print(heaterPidActive ? 1 : 0);
-  Serial1.print(",");
-  Serial1.print(heaterSoftLimited ? 1 : 0);   // [VOFA输出扩展] 软限温状态
+  Serial1.print((heaterTriggerEnabled && heaterDelayMicros > 0) ? 1 : 0);
   Serial1.write('\n');        // 真正的换行符 0x0A
   Serial1.flush();
   delayMicroseconds(20);
   digitalWrite(DE_RE_Pin, LOW);
   lastRS485SendTime = millis();
 
-  // --- PID 计算 (输出为归一化调功量 0~1) ---
+  // --- PID 计算已禁用（固定功率模式），heaterTriggerEnabled 由外部设置，不覆盖 ---
   if (!heaterPidActive) {
     return;
   }
 
-  float error      = PID_SETPOINT - filteredTemperature;
+  float error    = PID_SETPOINT - filteredTemperature;
+  pidIntegral   += error * dt;
+  pidIntegral    = constrain(pidIntegral, -50.0f, 50.0f);
   float derivative = (error - pidLastError) / dt;
+  pidLastError   = error;
 
-  // [抗积分饱和] 先用当前积分计算未饱和输出 duty，再判断是否允许积分累加
-  float unsatDuty = PID_KP * error + PID_KI * pidIntegral + PID_KD * derivative;
-  float outputDuty = constrain(unsatDuty, 0.0f, 1.0f);
+  float output = PID_KP * error + PID_KI * pidIntegral + PID_KD * derivative;
 
-  bool saturatedHigh = (unsatDuty > 1.0f);
-  bool saturatedLow  = (unsatDuty < 0.0f);
-  bool allowIntegrate = false;
-  if (!saturatedHigh && !saturatedLow) {
-    allowIntegrate = true;                    // 未饱和
-  } else if (saturatedHigh && error < 0.0f) {
-    allowIntegrate = true;                    // 上饱和但误差为负，允许减小积分
-  } else if (saturatedLow && error > 0.0f) {
-    allowIntegrate = true;                    // 下饱和但误差为正，允许增大积分
-  }
-
-  if (allowIntegrate) {
-    pidIntegral += error * dt;
-    pidIntegral  = constrain(pidIntegral, -50.0f, 50.0f); // 积分硬限幅(双保险)
-    // 用更新后的积分重新计算输出
-    unsatDuty = PID_KP * error + PID_KI * pidIntegral + PID_KD * derivative;
-    outputDuty = constrain(unsatDuty, 0.0f, 1.0f);
-  }
-
-  pidLastError = error;
-
-  // [调试软限温] 软限温激活时PID仍运行，但最终输出强制为0
-  if (heaterSoftLimited) {
-    outputDuty = 0.0f;
-    pidIntegral = 0.0f;
-  }
-
-  // 将归一化调功指令输出到加热器
-  setHeaterDuty(outputDuty);
-}
-
-// ================= 14. 加热调功与PID辅助函数 ================= [归一化PID改动2]
-
-// 设置加热归一化调功量 duty (0~1)
-// 注：duty 是调功指令，可控硅移相控制下实际加热功率与触发角并非严格线性
-// 映射：delayUs = 10000 * (1 - duty)，限幅到 [100, 9900]，支持 1%~100% 连续调功
-void setHeaterDuty(float duty) {
-  duty = constrain(duty, 0.0f, 1.0f);
-
-  if (duty <= 0.0f) {
+  if (output <= 0.0f) {
     heaterTriggerEnabled = false;
     heaterDelayMicros = 0;
-    lastHeaterDuty = 0.0f;
-    return;
+  } else {
+    heaterTriggerEnabled = true;
+    int delayUs = (int)(8000.0f - (output / 100.0f) * 7900.0f);
+    delayUs = constrain(delayUs, 100, 8000);
+    heaterDelayMicros = (uint16_t)delayUs;
   }
-
-  int delayUs = (int)(10000.0f * (1.0f - duty));
-  delayUs = constrain(delayUs, 100, 9900);
-
-  heaterTriggerEnabled = true;
-  heaterDelayMicros = (uint16_t)delayUs;
-  lastHeaterDuty = duty;
-}
-
-// PID 状态复位（启动 PID 控制前调用，避免积分残留）
-void resetHeaterPid() {
-  pidIntegral  = 0.0f;
-  pidLastError = PID_SETPOINT - filteredTemperature;
-  lastPidTime  = millis();
-  lastHeaterDuty = 0.0f;
 }
