@@ -80,9 +80,9 @@ unsigned long lastTempTime = 0;    // 上次温度更新时间
 
 // --- PID 水温控制 ---
 #define PID_SETPOINT  38.0f
-#define PID_KP        6.0f
-#define PID_KI        0.05f
-#define PID_KD        1.0f
+#define PID_KP        0.02f
+#define PID_KI        0.011f
+#define PID_KD        0.01f
 
 bool    heaterPidActive = false;
 float   pidIntegral     = 0.0f;
@@ -474,6 +474,7 @@ void loop() {
   if (nozzleCleanActive) {
     if (millis() - nozzleCleanStartTime >= 30000) {
       // 30秒到，关闭加热器、电磁阀3、水泵
+      heaterPidActive = false;
       heaterTriggerEnabled = false;
       heaterDelayMicros = 0;
       digitalWrite(PIN_VALVE3, LOW);
@@ -487,11 +488,13 @@ void loop() {
   // === 检查加热器启动延时（防干烧：先开水泵，1秒后再开加热器） ===
   if (heaterPendingStart) {
     if (millis() - heaterStartDelayTime >= 1000) {
-      // 1秒延时到，启动水即热（50%功率）
-      heaterTriggerEnabled = true;
-      heaterDelayMicros = 5000;
+      // 1秒延时到，启动PID水温控制
+      pidIntegral   = 0.0f;
+      pidLastError  = 0.0f;
+      lastPidTime   = millis();
+      heaterPidActive = true;
       heaterPendingStart = false;
-      Serial.println("Heater started after 1s delay (50% power)");
+      Serial.println("Heater PID started after 1s delay");
     }
   }
 
@@ -1153,7 +1156,29 @@ void finishRevolutionMotor2() {
 void stopMotor1() { motor1Nibble = 0x00; }
 void stopMotor2() { motor2Nibble = 0x00; }
 
-// ================= 11. 温度监控功能 =================
+// ================= 11. 加热器延时查表（功率线性化） =================
+// 对照表：5% 步长，index 0 = 5%，index 18 = 95%
+// 值越小 = 触发越早 = 功率越高
+static const uint16_t delay_table[19] = {
+  7980, 7410, 7000, 6640, 6320, 6030, 5760, 5500, 5250,
+  5000, 4750, 4500, 4240, 3970, 3680, 3360, 3000, 2590, 2020
+};
+
+// 将功率百分比（5.0 ~ 95.0）映射为触发延时微秒数（O(1) 线性插值）
+uint16_t getHeaterDelay(float power_percent) {
+  if (power_percent <= 5.0f)  return delay_table[0];
+  if (power_percent >= 95.0f) return delay_table[18];
+
+  // 等间距步长 5%，直接计算左端点索引，无需循环
+  float scaled = power_percent / 5.0f;  // 5%->1.0, 10%->2.0 ...
+  int idx = (int)scaled - 1;            // delay_table 左端点索引
+
+  // 区间内小数部分用于线性插值
+  float t = scaled - (float)(idx + 1);
+  return (uint16_t)(delay_table[idx] + t * ((float)delay_table[idx + 1] - (float)delay_table[idx]));
+}
+
+// ================= 12. 温度监控功能 =================
 
 // 读取NTC温度传感器
 float readTemperature() {
@@ -1340,7 +1365,7 @@ void runPidTask() {
   digitalWrite(DE_RE_Pin, LOW);
   lastRS485SendTime = millis();
 
-  // --- PID 计算已禁用（固定功率模式），heaterTriggerEnabled 由外部设置，不覆盖 ---
+  // --- PID 水温控制 ---
   if (!heaterPidActive) {
     return;
   }
@@ -1353,13 +1378,12 @@ void runPidTask() {
 
   float output = PID_KP * error + PID_KI * pidIntegral + PID_KD * derivative;
 
-  if (output <= 0.0f) {
+  float power = constrain(output, 0.0f, 95.0f);
+  if (power < 5.0f) {
     heaterTriggerEnabled = false;
     heaterDelayMicros = 0;
   } else {
     heaterTriggerEnabled = true;
-    int delayUs = (int)(8000.0f - (output / 100.0f) * 7900.0f);
-    delayUs = constrain(delayUs, 100, 8000);
-    heaterDelayMicros = (uint16_t)delayUs;
+    heaterDelayMicros = getHeaterDelay(power);
   }
 }
