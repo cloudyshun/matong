@@ -70,8 +70,9 @@ volatile bool targetStateMacerator = false;
 volatile uint16_t fanDelayMicros = 0;  // 延时时间(微秒)，0=关闭
 volatile bool fanTriggerEnabled = false; // 是否启用风扇加热丝
 
-// --- 水即热装置移相调压控制 ---
-// heaterTriggerEnabled/heaterDelayMicros 已在上方声明
+// --- [新增] 水即热装置移相调压控制 ---
+volatile uint16_t heaterDelayMicros = 0;  // 延时时间(微秒)，0=关闭，100=立即触发(100%)
+volatile bool heaterTriggerEnabled = false; // 是否启用加热器
 
 // --- 温度监控相关变量 ---
 float currentTemperature = 0.0;
@@ -79,19 +80,15 @@ float filteredTemperature = 0.0;  // 一阶低通滤波后的温度
 unsigned long lastTempTime = 0;    // 上次温度更新时间
 
 // --- PID 水温控制 ---
-#define PID_SETPOINT  40.0f
-#define PID_KP        2.0f
-#define PID_KI        1.1f
+#define PID_SETPOINT  38.0f
+#define PID_KP        6.0f
+#define PID_KI        0.05f
 #define PID_KD        1.0f
 
 bool    heaterPidActive = false;
 float   pidIntegral     = 0.0f;
 float   pidLastError    = 0.0f;
 unsigned long lastPidTime = 0;
-
-// 水即热装置移相调压控制
-volatile uint16_t heaterDelayMicros = 5000; // 延时时间(微秒)，5000=50%功率，100=100%，9900=0%
-volatile bool heaterTriggerEnabled = false;  // 是否启用加热器
 
 // --- 步进电机相关变量 ---
 byte currentShiftOutput = 0; // 595当前的输出字节
@@ -134,10 +131,6 @@ unsigned long maceratingStartTime = 0;     // 粉碎开始时间
 bool maceratorCleanActive = false;         // 粉碎泵自洁是否激活
 unsigned long maceratorCleanStartTime = 0; // 粉碎泵自洁开始时间
 
-// 喷嘴自洁功能控制（cmdAction3）
-bool nozzleCleanActive = false;            // 喷嘴自洁是否激活
-unsigned long nozzleCleanStartTime = 0;    // 喷嘴自洁开始时间
-
 unsigned long lastRS485SendTime = 0;       // 上次RS485发送时间（用于避免连包）
 
 // 水位传感器相关变量（查询功能已停用，保留变量供编译）
@@ -151,7 +144,7 @@ bool dirtyWaterTankOK = true;
 bool heaterPendingStart = false;           // 加热器等待启动标志
 unsigned long heaterStartDelayTime = 0;    // 加热器启动延时计时器
 bool heaterPendingStop = false;            // 加热器等待关闭标志
-unsigned long heaterStopDelayTime = 0;     // 加热器关闭延时计时器
+unsigned long heaterStopDelayTime = 0;     // 加热器关闭延时计时器 
 
 // 电机1 运行时参数
 bool motor1Running = false;
@@ -260,9 +253,12 @@ void onDirtyWaterTankFull(); // 污水箱满了处理函数
 // ================= 6. 定时器回调函数 =================
 // 定时器中断：延时后触发可控硅（水即热）
 void heaterTimerCallback() {
+  // 输出100微秒的低电平脉冲触发可控硅
   digitalWrite(PIN_HEATER, LOW);
   delayMicroseconds(100);
   digitalWrite(PIN_HEATER, HIGH);
+
+  // 停止定时器，等待下次过零触发
   timer_pause(TIMER2);
 }
 
@@ -329,18 +325,20 @@ void setup() {
   Serial.println("NTC Temperature Sensor Initialized");
 
   // --- [关键] 配置定时器2用于水即热延时触发 ---
+  // 使用libmaple原生API配置定时器
   timer_pause(TIMER2);
   timer_set_prescaler(TIMER2, 71); // 72MHz / (71+1) = 1MHz，即1微秒计数
   timer_set_mode(TIMER2, TIMER_CH1, TIMER_OUTPUT_COMPARE);
-  timer_set_reload(TIMER2, heaterDelayMicros);
-  timer_attach_interrupt(TIMER2, TIMER_UPDATE_INTERRUPT, heaterTimerCallback);
+  timer_set_reload(TIMER2, 10000); // 默认10ms
+  timer_attach_interrupt(TIMER2, TIMER_CH1, heaterTimerCallback);
+  // 注意：不在这里启动定时器，而是在过零中断中按需启动
 
   // --- [关键] 配置定时器3用于风扇加热丝延时触发 ---
   timer_pause(TIMER3);
   timer_set_prescaler(TIMER3, 71); // 72MHz / (71+1) = 1MHz，即1微秒计数
   timer_set_mode(TIMER3, TIMER_CH1, TIMER_OUTPUT_COMPARE);
   timer_set_reload(TIMER3, 10000); // 默认10ms
-  timer_attach_interrupt(TIMER3, TIMER_UPDATE_INTERRUPT, fanTimerCallback);
+  timer_attach_interrupt(TIMER3, TIMER_CH1, fanTimerCallback);
   // 注意：不在这里启动定时器，而是在过零中断中按需启动
 
   // --- [关键] 开启 PA0 过零检测中断 ---
@@ -470,29 +468,14 @@ void loop() {
     }
   }
 
-  // === 检查喷嘴自洁30秒超时 ===
-  if (nozzleCleanActive) {
-    if (millis() - nozzleCleanStartTime >= 30000) {
-      // 30秒到，关闭加热器、电磁阀3、水泵
-      heaterPidActive = false;
-      heaterTriggerEnabled = false;
-      heaterDelayMicros = 0;
-      digitalWrite(PIN_VALVE3, LOW);
-      heaterPendingStop = true;
-      heaterStopDelayTime = millis();
-      nozzleCleanActive = false;
-      Serial.println("Nozzle clean finished (30 seconds elapsed)");
-    }
-  }
-
   // === 检查加热器启动延时（防干烧：先开水泵，1秒后再开加热器） ===
   if (heaterPendingStart) {
     if (millis() - heaterStartDelayTime >= 1000) {
-      // 1秒延时到，启动PID水温控制
+      // 1秒延时到，激活PID控制
+      heaterPidActive = true;
       pidIntegral   = 0.0f;
       pidLastError  = 0.0f;
       lastPidTime   = millis();
-      heaterPidActive = true;
       heaterPendingStart = false;
       Serial.println("Heater PID started after 1s delay");
     }
@@ -530,11 +513,15 @@ void loop() {
 void zeroCrossingISR() {
   // 风扇加热丝：使用移相调压控制
   if (fanTriggerEnabled && fanDelayMicros > 0) {
+    // 确保PA1为高电平（可控硅关断状态）
     digitalWrite(PIN_FAN, HIGH);
+
+    // 设置定时器延时时间并启动
     timer_set_reload(TIMER3, fanDelayMicros);
-    timer_set_count(TIMER3, 0);
-    timer_resume(TIMER3);
+    timer_set_count(TIMER3, 0); // 重置计数器
+    timer_resume(TIMER3); // 启动定时器
   } else {
+    // 关闭状态：保持高电平
     digitalWrite(PIN_FAN, HIGH);
   }
 
@@ -542,13 +529,17 @@ void zeroCrossingISR() {
   digitalWrite(PIN_PUMP,      targetStatePump      ? LOW : HIGH);
   digitalWrite(PIN_MACERATOR, targetStateMacerator ? LOW : HIGH);
 
-  // 水即热：移相调压
+  // 水即热装置：使用移相调压控制
   if (heaterTriggerEnabled && heaterDelayMicros > 0) {
+    // 确保PA3为高电平（可控硅关断状态）
     digitalWrite(PIN_HEATER, HIGH);
+
+    // 设置定时器延时时间并启动
     timer_set_reload(TIMER2, heaterDelayMicros);
-    timer_set_count(TIMER2, 0);
-    timer_resume(TIMER2);
+    timer_set_count(TIMER2, 0); // 重置计数器
+    timer_resume(TIMER2); // 启动定时器
   } else {
+    // 关闭状态：保持高电平
     digitalWrite(PIN_HEATER, HIGH);
   }
 }
@@ -713,7 +704,7 @@ void processHexCommand(byte cmd[8]) {
     sendHex485(cmd); return;
   }
   
-  // 3. 水即热控制 (支持功率调节)
+  // 3. 水即热控制 (新版：支持功率调节)
   else if (memcmp(cmd, cmdHeatOff_New, 8) == 0) {
     heaterTriggerEnabled = false;
     heaterDelayMicros = 0;
@@ -1142,13 +1133,7 @@ void finishRevolutionMotor2() {
   if (command3Status == 3 && !motor1Running && !motor2Running) {
     digitalWrite(PIN_VALVE3, HIGH); // 打开电磁阀3
     targetStatePump = true; // 打开水泵
-    // 启动加热器延时保护：先开水泵，1秒后再开加热器
-    heaterPendingStart = true;
-    heaterStartDelayTime = millis();
-    // 启动30秒超时计时
-    nozzleCleanActive = true;
-    nozzleCleanStartTime = millis();
-    Serial.println("CMD3: Both motors stopped, Valve 3 ON, Pump ON, heater will start in 1s");
+    Serial.println("CMD3: Both motors stopped, Valve 3 ON, Pump ON");
     command3Status = 0; // 重置状态
   }
 }
@@ -1156,29 +1141,7 @@ void finishRevolutionMotor2() {
 void stopMotor1() { motor1Nibble = 0x00; }
 void stopMotor2() { motor2Nibble = 0x00; }
 
-// ================= 11. 加热器延时查表（功率线性化） =================
-// 对照表：5% 步长，index 0 = 5%，index 18 = 95%
-// 值越小 = 触发越早 = 功率越高
-static const uint16_t delay_table[19] = {
-  7980, 7410, 7000, 6640, 6320, 6030, 5760, 5500, 5250,
-  5000, 4750, 4500, 4240, 3970, 3680, 3360, 3000, 2590, 2020
-};
-
-// 将功率百分比（5.0 ~ 95.0）映射为触发延时微秒数（O(1) 线性插值）
-uint16_t getHeaterDelay(float power_percent) {
-  if (power_percent <= 5.0f)  return delay_table[0];
-  if (power_percent >= 95.0f) return delay_table[18];
-
-  // 等间距步长 5%，直接计算左端点索引，无需循环
-  float scaled = power_percent / 5.0f;  // 5%->1.0, 10%->2.0 ...
-  int idx = (int)scaled - 1;            // delay_table 左端点索引
-
-  // 区间内小数部分用于线性插值
-  float t = scaled - (float)(idx + 1);
-  return (uint16_t)(delay_table[idx] + t * ((float)delay_table[idx + 1] - (float)delay_table[idx]));
-}
-
-// ================= 12. 温度监控功能 =================
+// ================= 11. 温度监控功能 =================
 
 // 读取NTC温度传感器
 float readTemperature() {
@@ -1338,52 +1301,52 @@ void runPidTask() {
   float dt = (now - lastPidTime) / 1000.0f;  // 转换为秒
   lastPidTime = now;
 
-  // 采样温度 + 一阶低通滤波（首次用原始温度初始化，避免从0开始）
-  static bool tempFilterInitialized = false;
+  // 采样温度 + 一阶低通滤波
   currentTemperature = readTemperature();
-  if (!tempFilterInitialized) {
-    filteredTemperature = currentTemperature;
-    tempFilterInitialized = true;
-  } else {
-    filteredTemperature = 0.2f * currentTemperature + 0.8f * filteredTemperature;
-  }
+  filteredTemperature = (0.2f * currentTemperature) + (0.8f * filteredTemperature);
 
   // --- VOFA+ FireWater 字符串发送 ---
-  // 格式：目标温度,原始温度,滤波温度\n
+  // 格式：目标温度,滤波后温度\n
   digitalWrite(DE_RE_Pin, HIGH);
   delayMicroseconds(20);
   Serial1.print(PID_SETPOINT, 1);
   Serial1.print(",");
-  Serial1.print(currentTemperature, 1);
-  Serial1.print(",");
   Serial1.print(filteredTemperature, 1);
-  Serial1.print(",");
-  Serial1.print((heaterTriggerEnabled && heaterDelayMicros > 0) ? 1 : 0);
   Serial1.write('\n');        // 真正的换行符 0x0A
   Serial1.flush();
   delayMicroseconds(20);
   digitalWrite(DE_RE_Pin, LOW);
   lastRS485SendTime = millis();
 
-  // --- PID 水温控制 ---
+  // --- PID 计算（使用滤波后温度）---
   if (!heaterPidActive) {
+    // 加热器未激活时确保关闭
+    heaterTriggerEnabled = false;
+    heaterDelayMicros = 0;
     return;
   }
 
   float error    = PID_SETPOINT - filteredTemperature;
   pidIntegral   += error * dt;
+  // 积分限幅，防止积分饱和
   pidIntegral    = constrain(pidIntegral, -50.0f, 50.0f);
   float derivative = (error - pidLastError) / dt;
   pidLastError   = error;
 
   float output = PID_KP * error + PID_KI * pidIntegral + PID_KD * derivative;
 
-  float power = constrain(output, 0.0f, 95.0f);
-  if (power < 5.0f) {
+  // 将PID输出映射到 heaterDelayMicros
+  // output > 0 表示需要加热，output范围约 0~100 对应延时 8000~100 微秒
+  // output <= 0 表示温度已够高，关闭加热器
+  if (output <= 0.0f) {
     heaterTriggerEnabled = false;
     heaterDelayMicros = 0;
   } else {
     heaterTriggerEnabled = true;
-    heaterDelayMicros = getHeaterDelay(power);
+    // output越大，延时越小（导通越早，功率越大）
+    // 线性映射：output=1→8000us(≈20%), output=100→100us(≈100%)
+    int delayUs = (int)(8000.0f - (output / 100.0f) * 7900.0f);
+    delayUs = constrain(delayUs, 100, 8000);
+    heaterDelayMicros = (uint16_t)delayUs;
   }
 }
